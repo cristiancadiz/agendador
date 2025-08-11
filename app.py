@@ -65,7 +65,7 @@ def wa_is_dup(message_id: str) -> bool:
     _PROCESADOS[message_id] = now + WA_DEDUP_TTL
     return False
 
-# Validaciones iniciales
+# Validaciones inicialess
 if not os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON"):
     raise Exception("Falta GOOGLE_SERVICE_ACCOUNT_JSON en variables de entorno.")
 if not CALENDAR_ID:
