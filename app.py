@@ -8,7 +8,7 @@ import dateparser
 
 from calendar_client import CalendarClient
 
-# ====== Config ======
+# ====== Config ======a
 TIMEZONE = os.getenv("TIMEZONE", "America/Santiago")
 CALENDAR_ID = os.getenv("GOOGLE_CALENDAR_ID")  # e.g. tu_calendario@group.calendar.google.com
 
