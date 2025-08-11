@@ -2,11 +2,13 @@ import os
 import re
 import json
 import time
+import base64
 from uuid import uuid4
 from datetime import timedelta, datetime
 from zoneinfo import ZoneInfo
+from urllib.parse import quote, urlparse, parse_qs
 
-from flask import Flask, request, jsonify, render_template_string, redirect
+from flask import Flask, request, jsonify, render_template_string, redirect, Response
 import dateparser
 
 # Google Calendar
@@ -21,14 +23,13 @@ from openai import OpenAI
 import requests
 
 # =========================
-# Configuración / Entorno
+# Config / Entorno
 # =========================
 TIMEZONE = os.getenv("TIMEZONE", "America/Santiago")
 CALENDAR_ID = os.getenv("GOOGLE_CALENDAR_ID")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 OPENAI_MODEL = "gpt-3.5-turbo"  # fijo
 
-# Identidad y saludo
 COMPANY_NAME = os.getenv("COMPANY_NAME", "Departamento de Cobranza")
 GREETING_TEXT = os.getenv(
     "GREETING_TEXT",
@@ -37,7 +38,7 @@ GREETING_TEXT = os.getenv(
 
 # WhatsApp Cloud API
 WA_TOKEN = os.getenv("WA_TOKEN")
-WA_PHONE_ID = os.getenv("WA_PHONE_ID")  # usado como fallback
+WA_PHONE_ID = os.getenv("WA_PHONE_ID")  # fallback
 WA_VERIFY_TOKEN = os.getenv("WA_VERIFY_TOKEN", "verify_me")
 DEBUG_WA = os.getenv("DEBUG_WA", "0") == "1"
 
@@ -82,13 +83,22 @@ app = Flask(__name__)
 # =========================
 # Estado por sesión
 # =========================
-# { session_id: {
-#     "history":[...],
-#     "slots":{"nombre","datetime_text","fecha","hora","telefono","email"},
-#     "awaiting_confirm": bool,
-#     "candidate": {...}
-# } }
+# { session_id: { "history":[...], "slots":{nombre,datetime_text,fecha,hora,telefono,email},
+#                 "awaiting_confirm": bool, "candidate": {...}, "last_event_id": str } }
 SESSIONS = {}
+
+def _get_session(session_id: str):
+    s = SESSIONS.get(session_id)
+    if not s:
+        s = {
+            "history": [],
+            "slots": {"nombre":"", "datetime_text":"", "fecha":"", "hora":"", "telefono":"", "email":""},
+            "awaiting_confirm": False,
+            "candidate": None,
+            "last_event_id": None,
+        }
+        SESSIONS[session_id] = s
+    return s
 
 # =========================
 # HTML: Chat Web
@@ -170,7 +180,7 @@ function addMsg(text, who='bot'){
   chat.scrollTop = chat.scrollHeight;
 }
 
-function addEventCard(htmlLink, phone, email){
+function addEventCard(htmlLink, phone, email, icsUrl, gcalUrl){
   const div = document.createElement('div');
   div.className = 'msg bot';
   const safePhone = phone ? phone : '—';
@@ -181,7 +191,9 @@ function addEventCard(htmlLink, phone, email){
         <div><b>Llamada agendada</b></div>
         <div>📞 Teléfono: <b>${safePhone}</b></div>
         <div>✉️ Correo: <b>${safeMail}</b></div>
-        ${htmlLink ? `<div>📅 <a href="${htmlLink}" target="_blank" rel="noopener">Ver en Google Calendar</a></div>` : ``}
+        ${htmlLink ? `<div>📅 <a href="${htmlLink}" target="_blank" rel="noopener">Ver en mi Google Calendar</a></div>` : ``}
+        ${gcalUrl ? `<div>➕ <a href="${gcalUrl}" target="_blank" rel="noopener">Añadir a Google Calendar</a></div>` : ``}
+        ${icsUrl ? `<div>📄 <a href="${icsUrl}" target="_blank" rel="noopener">Descargar .ics</a></div>` : ``}
       </div>
     </div>`;
   chat.appendChild(div);
@@ -208,7 +220,7 @@ async function callBot(text){
   const data = await resp.json();
   addMsg(data.reply || '(sin respuesta)', 'bot');
   if (data.done && data.evento) {
-    addEventCard(data.evento.htmlLink, data.evento.telefono, data.evento.email);
+    addEventCard(data.evento.htmlLink, data.evento.telefono, data.evento.email, data.evento.icsUrl, data.evento.gcalAddUrl);
   }
 }
 
@@ -262,7 +274,6 @@ def parse_datetime_es(payload: dict):
 
     dt_text = (payload.get("datetime_text") or "").strip()
     if dt_text:
-        # Exige hora; normaliza "13 horas", "a las 13", o "13" al final
         txt = dt_text.lower()
         # "13 horas" / "13 hrs" / "13 h"
         txt = re.sub(r"\b(a\s*las\s*)?(\d{1,2})\s*(h|hs|hrs|horas)\b", r"\2:00", txt)
@@ -291,7 +302,62 @@ def parse_datetime_es(payload: dict):
     return None
 
 # =========================
-# Google Calendar helpers
+# Links “Añadir a GCal” y .ics
+# =========================
+def _to_utc_fmt(dt):
+    """YYYYMMDDTHHMMSSZ en UTC."""
+    dt_utc = dt.astimezone(ZoneInfo("UTC"))
+    return dt_utc.strftime("%Y%m%dT%H%M%SZ")
+
+def make_gcal_template_link(summary: str, start_dt, end_dt, description: str = "", location: str = ""):
+    # https://calendar.google.com/calendar/render?action=TEMPLATE...
+    qs = {
+        "action": "TEMPLATE",
+        "text": summary or "Cita",
+        "dates": f"{_to_utc_fmt(start_dt)}/{_to_utc_fmt(end_dt)}",
+        "details": description or "",
+        "location": location or "",
+    }
+    base = "https://calendar.google.com/calendar/render?"
+    return base + "&".join([f"{k}={quote(v)}" for k, v in qs.items() if v])
+
+def build_ics_from_event(ev: dict):
+    """
+    Genera contenido .ics a partir del evento de Google.
+    Usa UTC para máxima compatibilidad.
+    """
+    uid = ev.get("id") + "@bot-citas"
+    summary = ev.get("summary", "Cita")
+    description = (ev.get("description") or "").replace("\n", "\\n")
+    start = ev["start"]["dateTime"]
+    end   = ev["end"]["dateTime"]
+
+    # Asegura datetime con tz y pásalo a UTC
+    start_dt = datetime.fromisoformat(start.replace("Z","+00:00"))
+    end_dt   = datetime.fromisoformat(end.replace("Z","+00:00"))
+    dtstamp  = _to_utc_fmt(datetime.now(ZoneInfo("UTC")))
+
+    ics = "\r\n".join([
+        "BEGIN:VCALENDAR",
+        "VERSION:2.0",
+        "PRODID:-//Bot Citas//EN",
+        "CALSCALE:GREGORIAN",
+        "METHOD:PUBLISH",
+        "BEGIN:VEVENT",
+        f"UID:{uid}",
+        f"DTSTAMP:{dtstamp}",
+        f"DTSTART:{_to_utc_fmt(start_dt)}",
+        f"DTEND:{_to_utc_fmt(end_dt)}",
+        f"SUMMARY:{summary}",
+        f"DESCRIPTION:{description}",
+        "END:VEVENT",
+        "END:VCALENDAR",
+        ""
+    ])
+    return ics
+
+# =========================
+# Helpers Google Calendar
 # =========================
 def build_event_payload(nombre, start_dt, end_dt, telefono="", email="", comentario=""):
     description_lines = [
@@ -350,12 +416,28 @@ def create_event_calendar(nombre, datetime_text=None, fecha=None, hora=None,
         sendUpdates="none",
     ).execute()
 
+    # Links para el cliente
+    gcal_link = make_gcal_template_link(
+        summary=event_body["summary"],
+        start_dt=start_dt,
+        end_dt=end_dt,
+        description=event_body.get("description","")
+    )
+    # URL pública al .ics servido por este backend
+    try:
+        base = request.host_url.rstrip("/")  # requiere contexto de request
+        ics_url = f"{base}/ics/{created.get('id')}.ics"
+    except RuntimeError:
+        ics_url = ""
+
     msg = format_confirmation_message(nombre or "Cliente", start_dt, telefono)
     created["telefono"] = telefono
     created["email"] = email
+    created["icsUrl"] = ics_url
+    created["gcalAddUrl"] = gcal_link
     return created, msg
 
-# --- EDITAR / ELIMINAR EVENTOS EN GOOGLE CALENDAR ---
+# --- EDITAR / ELIMINAR / REPROGRAMAR EVENTOS ---
 def update_event_calendar(event_id: str,
                           nombre: str | None = None,
                           datetime_text: str | None = None,
@@ -412,16 +494,48 @@ def update_event_calendar(event_id: str,
     updated = gc_service.events().update(calendarId=CALENDAR_ID, eventId=event_id, body=ev).execute()
     return updated, "Cita actualizada correctamente."
 
-def delete_event_calendar(event_id: str):
+def delete_event_calendar(event_id: str, calendar_id: str | None = None):
     """Elimina la cita."""
+    cal_id = calendar_id or CALENDAR_ID
     try:
-        gc_service.events().delete(calendarId=CALENDAR_ID, eventId=event_id, sendUpdates="none").execute()
+        gc_service.events().delete(calendarId=cal_id, eventId=event_id, sendUpdates="none").execute()
         return True, "Cita eliminada."
-    except HttpError:
-        return False, f"No pude eliminar la cita ({event_id})."
+    except HttpError as e:
+        return False, f"No pude eliminar la cita ({event_id}). {e.reason}"
+
+def extract_event_and_cal_from_eid(eid_or_link: str):
+    """
+    Acepta el 'eid' o el 'htmlLink' de Calendar y devuelve (event_id, calendar_id|None).
+    """
+    if not eid_or_link:
+        return None, None
+    # si viene un htmlLink, saca ?eid=...
+    if eid_or_link.startswith("http"):
+        try:
+            q = parse_qs(urlparse(eid_or_link).query)
+            eid = q.get("eid", [None])[0]
+        except Exception:
+            eid = None
+    else:
+        eid = eid_or_link
+
+    if not eid:
+        return None, None
+
+    try:
+        # base64 urlsafe sin padding
+        pad = '=' * (-len(eid) % 4)
+        decoded = base64.urlsafe_b64decode(eid + pad).decode("utf-8")
+        # formato: "<eventId> <calendarId>"
+        parts = decoded.split(" ")
+        event_id = parts[0] if parts else None
+        cal_id = parts[1] if len(parts) > 1 else None
+        return event_id, cal_id
+    except Exception:
+        return None, None
 
 # =========================
-# Rutas básicas / formulario
+# Rutas básicas / formulario / .ics
 # =========================
 @app.get("/")
 def root():
@@ -469,6 +583,8 @@ RESULT_HTML = """
     <li><b>Teléfono:</b> {{ telefono or "—" }}</li>
     <li><b>Correo:</b> {{ email or "—" }}</li>
     <li><b>Evento Calendar:</b> <a href="{{ html_link }}" target="_blank">abrir</a></li>
+    <li><b>Añadir a Google Calendar:</b> <a href="{{ gcal_add }}" target="_blank">link</a></li>
+    <li><b>Descargar .ics:</b> <a href="{{ ics_url }}" target="_blank">archivo</a></li>
   </ul>
   <pre style="white-space:pre-wrap;background:#0b1220;color:#e5e7eb;padding:12px;border-radius:6px">{{ pretty_event }}</pre>
   <p><a href="/nuevo">← Agendar otra</a> | <a href="/chat">Ir al chat</a></p>
@@ -503,12 +619,28 @@ def crear_cita_web():
         html_link=created.get("htmlLink"),
         telefono=created.get("telefono"),
         email=created.get("email"),
+        gcal_add=created.get("gcalAddUrl"),
+        ics_url=created.get("icsUrl"),
         pretty_event=pretty
     )
 
 @app.get("/chat")
 def chat_ui():
     return render_template_string(CHAT_HTML, tz=TIMEZONE, cal=CALENDAR_ID, greeting=GREETING_TEXT)
+
+@app.get("/ics/<event_id>.ics")
+def ics_download(event_id):
+    try:
+        ev = gc_service.events().get(calendarId=CALENDAR_ID, eventId=event_id).execute()
+    except HttpError:
+        return "No encontré la cita.", 404
+    ics = build_ics_from_event(ev)
+    filename = f"cita-{event_id}.ics"
+    headers = {
+        "Content-Disposition": f'attachment; filename="{filename}"',
+        "Content-Type": "text/calendar; charset=utf-8",
+    }
+    return Response(ics, headers=headers)
 
 # =========================
 # API JSON directa
@@ -536,6 +668,8 @@ def crear_cita_api():
             "end": created.get("end"),
             "telefono": created.get("telefono"),
             "email": created.get("email"),
+            "icsUrl": created.get("icsUrl"),
+            "gcalAddUrl": created.get("gcalAddUrl"),
         },
         "mensaje_para_cliente": msg
     }), 201
@@ -563,7 +697,7 @@ def editar_cita(event_id):
         "end": updated.get("end"),
     }}), 200
 
-# DELETE /cita/<id>  (eliminar)
+# DELETE /cita/<id>  (eliminar por ID directo)
 @app.delete("/cita/<event_id>")
 def eliminar_cita(event_id):
     ok, msg = delete_event_calendar(event_id)
@@ -571,8 +705,109 @@ def eliminar_cita(event_id):
         return jsonify({"ok": False, "error": msg}), 400
     return jsonify({"ok": True, "mensaje": msg}), 200
 
+# POST /cita/borrar (flex: event_id o htmlLink/eid)
+@app.post("/cita/borrar")
+def borrar_cita_flexible():
+    data = request.get_json(silent=True) or {}
+    event_id = (data.get("event_id") or "").strip()
+    html_link = (data.get("htmlLink") or data.get("html_link") or "").strip()
+    eid = (data.get("eid") or "").strip()
+
+    cal_from_eid = None
+    if not event_id:
+        event_id, cal_from_eid = extract_event_and_cal_from_eid(html_link or eid)
+
+    if not event_id:
+        return jsonify({"ok": False, "error": "Falta event_id o htmlLink/eid válido."}), 400
+
+    ok, msg = delete_event_calendar(event_id, calendar_id=cal_from_eid or CALENDAR_ID)
+    if not ok:
+        return jsonify({"ok": False, "error": msg}), 400
+    return jsonify({"ok": True, "mensaje": "Cita eliminada.", "eventId": event_id}), 200
+
+# POST /cita/reprogramar (crea nueva y elimina anterior)
+@app.post("/cita/reprogramar")
+def reprogramar_cita():
+    data = request.get_json(silent=True) or {}
+    old_event_id = (data.get("event_id") or "").strip()
+    html_link = (data.get("htmlLink") or data.get("html_link") or "").strip()
+    eid = (data.get("eid") or "").strip()
+
+    cal_from_eid = None
+    if not old_event_id:
+        old_event_id, cal_from_eid = extract_event_and_cal_from_eid(html_link or eid)
+    cal_id = cal_from_eid or CALENDAR_ID
+
+    # intentar leer datos del evento anterior
+    old = None
+    if old_event_id:
+        try:
+            old = gc_service.events().get(calendarId=cal_id, eventId=old_event_id).execute()
+        except HttpError:
+            old = None
+
+    # parsear contacto previo de la descripción
+    def pick_from_desc(label, desc):
+        if not desc:
+            return ""
+        m = re.search(fr"{label}:\s*(.+)", desc)
+        return m.group(1).strip() if m else ""
+
+    nombre_old = ""
+    telefono_old = ""
+    email_old = ""
+    if old:
+        desc_prev = old.get("description") or ""
+        nombre_old = pick_from_desc("Nombre", desc_prev)
+        telefono_old = pick_from_desc("Teléfono", desc_prev)
+        email_old = pick_from_desc("Email", desc_prev)
+        if not nombre_old:
+            nombre_old = re.sub(r"^Llamada con\s*", "", old.get("summary","")).strip() or "Cliente"
+
+    # nuevos datos
+    nombre   = (data.get("nombre") or nombre_old or "Cliente").strip()
+    telefono = (data.get("telefono") or telefono_old).strip()
+    email    = (data.get("email") or email_old).strip()
+    comentario = (data.get("comentario") or "").strip()
+
+    # nueva fecha/hora
+    created, msg = create_event_calendar(
+        nombre=nombre,
+        datetime_text=data.get("datetime_text"),
+        fecha=data.get("fecha"),
+        hora=data.get("hora"),
+        telefono=telefono,
+        email=email,
+        comentario=comentario
+    )
+    if not created:
+        return jsonify({"ok": False, "error": msg}), 400
+
+    # eliminar la anterior si la teníamos identificada
+    deleted = False
+    del_error = None
+    if old_event_id:
+        ok, _msg = delete_event_calendar(old_event_id, calendar_id=cal_id)
+        deleted = ok
+        if not ok:
+            del_error = _msg
+
+    return jsonify({
+        "ok": True,
+        "mensaje": msg + (" Se eliminó la cita anterior." if deleted else " No pude eliminar la anterior." if old_event_id else ""),
+        "evento_nuevo": {
+            "id": created.get("id"),
+            "htmlLink": created.get("htmlLink"),
+            "start": created.get("start"),
+            "end": created.get("end"),
+            "icsUrl": created.get("icsUrl"),
+            "gcalAddUrl": created.get("gcalAddUrl"),
+        },
+        "eliminacion_anterior": {"hecho": deleted, "calendarId": cal_id, "eventId": old_event_id, "error": del_error}
+    }), 200
+
 # =========================
-# Chatbot con GPT 3.5 — Orquestación conversacional
+# Chatbot con GPT 3.5 — Orquestación
 # =========================
 SYSTEM_PROMPT = (
     "Eres el asistente de agenda de una empresa de cobranza judicial. "
@@ -593,20 +828,7 @@ SYSTEM_PROMPT = (
     "- No inventes datos."
 )
 
-def _get_session(session_id: str):
-    s = SESSIONS.get(session_id)
-    if not s:
-        s = {
-            "history": [],
-            "slots": {"nombre":"", "datetime_text":"", "fecha":"", "hora":"", "telefono":"", "email":""},
-            "awaiting_confirm": False,
-            "candidate": None
-        }
-        SESSIONS[session_id] = s
-    return s
-
 def llm_orchestrate(history, slots, awaiting_confirm, candidate, user_message):
-    # Contexto breve para el modelo
     state = {
         "slots": slots,
         "awaiting_confirm": awaiting_confirm,
@@ -627,10 +849,7 @@ def llm_orchestrate(history, slots, awaiting_confirm, candidate, user_message):
         "} "
         "No agregues texto fuera del JSON."
     })
-
-    resp = oa_client.chat.completions.create(
-        model=OPENAI_MODEL, temperature=0.3, messages=messages
-    )
+    resp = oa_client.chat.completions.create(model=OPENAI_MODEL, temperature=0.3, messages=messages)
     raw = resp.choices[0].message.content or "{}"
     try:
         data = json.loads(raw)
@@ -638,7 +857,6 @@ def llm_orchestrate(history, slots, awaiting_confirm, candidate, user_message):
         data = {"reply": "¿Me indicas tu nombre, tu teléfono y una fecha/hora? (ej: 12/08 13:00). También tu correo, por favor.",
                 "slots": {"nombre":"", "datetime_text":"", "fecha":"", "hora":"", "telefono":"", "email":""},
                 "next_action": "ask_missing"}
-    # Normaliza
     data.setdefault("reply", "")
     data.setdefault("slots", {"nombre":"", "datetime_text":"", "fecha":"", "hora":"", "telefono":"", "email":""})
     data.setdefault("next_action", "none")
@@ -658,10 +876,9 @@ def process_chat(session_id: str, user_msg: str, telefono: str = "", email: str 
     if not user_msg:
         return {"reply": GREETING_TEXT, "done": False}
 
-    # 1) Orquestación por LLM
     plan = llm_orchestrate(history, slots, awaiting_confirm, candidate, user_msg)
 
-    # 2) Fusiona slots con SOLO lo detectado ahora
+    # fusionar slots con lo detectado ahora
     new_slots = plan.get("slots", {})
     for k in ["nombre", "datetime_text", "fecha", "hora", "telefono", "email"]:
         if new_slots.get(k):
@@ -671,7 +888,6 @@ def process_chat(session_id: str, user_msg: str, telefono: str = "", email: str 
     reply  = plan.get("reply") or GREETING_TEXT
     cand   = plan.get("candidate") or {}
 
-    # 3) Ejecuta acciones mínimas según plan
     if action == "confirm_time":
         session["awaiting_confirm"] = True
         cand_payload = {
@@ -679,7 +895,6 @@ def process_chat(session_id: str, user_msg: str, telefono: str = "", email: str 
             "datetime_text": cand.get("datetime_text") or slots.get("datetime_text"),
             "fecha": cand.get("fecha") or slots.get("fecha"),
             "hora":  cand.get("hora")  or slots.get("hora"),
-            # Fallback desde web/WA
             "telefono": (slots.get("telefono") or telefono or "").strip(),
             "email": (slots.get("email") or email or "").strip(),
             "comentario": comentario
@@ -714,12 +929,21 @@ def process_chat(session_id: str, user_msg: str, telefono: str = "", email: str 
             history += [{"role":"user","content":user_msg},{"role":"assistant","content":msg}]
             return {"reply": msg, "done": False}
 
-        # limpiar slots para próxima cita
+        # auto-borrar el último evento de esta sesión (reprogramación)
+        last_event_id = session.get("last_event_id")
+        if last_event_id:
+            try:
+                gc_service.events().delete(calendarId=CALENDAR_ID, eventId=last_event_id, sendUpdates="none").execute()
+            except HttpError:
+                pass
+        session["last_event_id"] = created.get("id")
+
+        # limpiar slots
         session["slots"] = {"nombre":"", "datetime_text":"", "fecha":"", "hora":"", "telefono":"", "email":""}
         history += [{"role":"user","content":user_msg},{"role":"assistant","content":msg}]
         return {"reply": msg, "done": True, "evento": created}
 
-    # smalltalk / ask_missing / none → responde natural y seguimos
+    # smalltalk / ask_missing / none
     history += [{"role":"user","content":user_msg},{"role":"assistant","content":reply}]
     return {"reply": reply, "done": False}
 
@@ -736,7 +960,7 @@ def chatbot():
     return jsonify(res)
 
 # =========================
-# WhatsApp Cloud API (con de-dup + phone_id dinámico)
+# WhatsApp Cloud API (de-dup + phone_id dinámico + .ics/link)
 # =========================
 @app.get("/whatsapp/webhook")
 def wa_verify():
@@ -761,13 +985,10 @@ def wa_incoming():
         changes = (entry.get("changes") or [])[0]
         value = changes.get("value", {})
 
-        # usa el phone_number_id que recibió el evento
         phone_id = (value.get("metadata") or {}).get("phone_number_id") or WA_PHONE_ID
-
         messages = value.get("messages", [])
         statuses = value.get("statuses", [])
 
-        # Ignora estatus (entregas/lecturas)
         if not messages:
             if DEBUG_WA and statuses:
                 print("WA STATUS >>>", json.dumps(statuses, ensure_ascii=False))
@@ -790,11 +1011,40 @@ def wa_incoming():
 
             url = f"https://graph.facebook.com/v20.0/{phone_id}/messages"
             headers = {"Authorization": f"Bearer {WA_TOKEN}", "Content-Type": "application/json"}
+
+            # 1) Mensaje de texto
             body = {"messaging_product": "whatsapp", "to": from_id, "text": {"body": res.get("reply") or "..."}} 
             r = requests.post(url, headers=headers, json=body, timeout=30)
-
             if DEBUG_WA:
                 print("WA OUT <<<", r.status_code, r.text)
+
+            # 2) Si se creó la cita, enviar .ics y link "Añadir a Google Calendar"
+            if res.get("done") and res.get("evento"):
+                ev = res["evento"]
+                # Documento .ics
+                if ev.get("icsUrl"):
+                    body_doc = {
+                      "messaging_product": "whatsapp",
+                      "to": from_id,
+                      "type": "document",
+                      "document": {
+                        "link": ev["icsUrl"],
+                        "filename": "cita.ics"
+                      }
+                    }
+                    rd = requests.post(url, headers=headers, json=body_doc, timeout=30)
+                    if DEBUG_WA:
+                        print("WA OUT DOC <<<", rd.status_code, rd.text)
+                # Link Añadir a GCal
+                if ev.get("gcalAddUrl"):
+                    body_link = {
+                      "messaging_product": "whatsapp",
+                      "to": from_id,
+                      "text": {"body": f"Para agregarla en tu Google Calendar: {ev['gcalAddUrl']}"}
+                    }
+                    rl = requests.post(url, headers=headers, json=body_link, timeout=30)
+                    if DEBUG_WA:
+                        print("WA OUT LINK <<<", rl.status_code, rl.text)
 
         return "ok", 200
     except Exception as e:
