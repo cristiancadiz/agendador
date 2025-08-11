@@ -1,0 +1,6 @@
+Flask==3.0.3
+google-api-python-client==2.147.0
+google-auth==2.33.0
+python-dateutil==2.9.0.post0
+dateparser==1.2.0
+gunicorn==22.0.0
