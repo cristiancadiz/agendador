@@ -449,13 +449,15 @@ def create_event_calendar(nombre, datetime_text=None, fecha=None, hora=None,
 
     end_dt = start_dt + timedelta(minutes=30)
 
-    ok_hours, msg_hours = within_business_hours(start_dt, end_dt)
-    if not ok_hours:
-        return None, msg_hours
-
+    # 👉 Primero disponibilidad (prioriza avisar 'ocupado' sobre fin de semana/horario)
     ok_free, msg_free = slot_is_free(start_dt, end_dt, CALENDAR_ID)
     if not ok_free:
         return None, msg_free
+
+    # Luego horario de atención
+    ok_hours, msg_hours = within_business_hours(start_dt, end_dt)
+    if not ok_hours:
+        return None, msg_hours
 
     event_body = build_event_payload(nombre or "Cliente", start_dt, end_dt, telefono, email, comentario)
     created = gc_service.events().insert(calendarId=CALENDAR_ID, body=event_body, sendUpdates="none").execute()
@@ -507,14 +509,16 @@ def update_event_calendar(event_id: str,
         except Exception:
             same_as_now = False
 
-        ok_hours, msg_hours = within_business_hours(start_dt, end_dt)
-        if not ok_hours:
-            return None, msg_hours
-
+        # 👉 Primero disponibilidad (si cambia el slot)
         if not same_as_now:
             ok_free, msg_free = slot_is_free(start_dt, end_dt, CALENDAR_ID)
             if not ok_free:
                 return None, msg_free
+
+        # Luego horario de atención
+        ok_hours, msg_hours = within_business_hours(start_dt, end_dt)
+        if not ok_hours:
+            return None, msg_hours
 
         ev["start"] = {"dateTime": start_dt.isoformat(), "timeZone": TIMEZONE}
         ev["end"]   = {"dateTime": end_dt.isoformat(),   "timeZone": TIMEZONE}
@@ -922,11 +926,6 @@ def llm_orchestrate(history, slots, awaiting_confirm, candidate, user_message):
             if isinstance(v, str):
                 data["candidate"][k] = v.strip()
     return data
-
-# ========= Conversación (incluye cancelación) =========
-CANCEL_RE = re.compile(r"\b(cancelar|anular|eliminar)\b.*\b(cita|llamada)\b", re.I)
-YES_RE = re.compile(r"^\s*(sí|si|ok|de acuerdo|confirmo|confirmar|adelante|proceder)\b", re.I)
-NO_RE  = re.compile(r"^\s*(no|cancelar no|mejor no|anular no)\b", re.I)
 
 def process_chat(session_id: str, user_msg: str, telefono: str = "", email: str = "", comentario: str = ""):
     session = _get_session(session_id)
