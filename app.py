@@ -1,5 +1,6 @@
 import os
 import json
+from uuid import uuid4
 from datetime import timedelta
 
 from flask import Flask, request, jsonify
@@ -68,7 +69,9 @@ def diag():
 
 @app.post("/cita")
 def crear_cita():
-    """Crea una cita en Google Calendar (sin invitados/correos)."""
+    """Crea una cita en Google Calendar con Google Meet (sin correos/attendees).
+       Si no se puede crear Meet, hace fallback y crea el evento igual.
+    """
     data = request.get_json(silent=True) or {}
 
     nombre = (data.get("nombre") or "Cliente").strip()
@@ -93,32 +96,62 @@ def crear_cita():
         "description": "\n".join(description_items),
         "start": {"dateTime": start_dt.isoformat(), "timeZone": TIMEZONE},
         "end": {"dateTime": end_dt.isoformat(), "timeZone": TIMEZONE},
-        # Sin 'attendees' para evitar 403 forbiddenForServiceAccounts
+        # Sin attendees para evitar 403 forbiddenForServiceAccounts
+        "conferenceData": {  # intentamos crear Meet
+            "createRequest": {"requestId": str(uuid4())}
+        },
     }
+
+    meet_link = None
+    fallback_note = None
 
     try:
         created = service.events().insert(
             calendarId=CALENDAR_ID,
             body=event_body,
-            sendUpdates="none",   # no envía correos
+            sendUpdates="none",         # no envía correos
+            conferenceDataVersion=1     # requerido para Meet
         ).execute()
     except HttpError as e:
-        status = getattr(e, "status_code", None) or (getattr(e, "resp", None).status if getattr(e, "resp", None) else 500)
+        # Si falla la creación de Meet, reintentamos sin conferenceData
         try:
             detail = e.content.decode() if hasattr(e, "content") and isinstance(e.content, (bytes, bytearray)) else str(e)
         except Exception:
             detail = str(e)
-        return jsonify({
-            "ok": False,
-            "where": "google_insert",
-            "status": int(status),
-            "error": "Google API error",
-            "details": detail
-        }), 502
+
+        event_body.pop("conferenceData", None)
+        try:
+            created = service.events().insert(
+                calendarId=CALENDAR_ID,
+                body=event_body,
+                sendUpdates="none",
+            ).execute()
+            fallback_note = "No se pudo crear Google Meet automáticamente; la cita se creó igual."
+        except Exception as e2:
+            status = getattr(e, "status_code", None) or (getattr(e, "resp", None).status if getattr(e, "resp", None) else 500)
+            return jsonify({
+                "ok": False,
+                "where": "google_insert",
+                "status": int(status),
+                "error": "Google API error",
+                "details": f"{detail} | Fallback error: {type(e2).__name__}: {e2}"
+            }), 502
     except Exception as e:
         return jsonify({"ok": False, "where": "unexpected", "error": f"{type(e).__name__}: {e}"}), 500
 
+    # Extraer link de Meet si existe
+    meet_link = (created.get("hangoutLink")
+                 or (created.get("conferenceData", {})
+                          .get("entryPoints", [{}])[0]
+                          .get("uri")))
+
     fecha_legible = start_dt.strftime("%d-%m-%Y %H:%M")
+    mensaje = f"Listo {nombre}, tu cita quedó solicitada para el {fecha_legible} (hora {TIMEZONE})."
+    if meet_link:
+        mensaje += f" Enlace Meet: {meet_link}"
+    elif fallback_note:
+        mensaje += f" ({fallback_note})"
+
     return jsonify({
         "ok": True,
         "evento": {
@@ -126,8 +159,9 @@ def crear_cita():
             "htmlLink": created.get("htmlLink"),
             "start": created.get("start"),
             "end": created.get("end"),
+            "meet_link": meet_link
         },
-        "mensaje_para_cliente": f"Listo {nombre}, tu cita quedó solicitada para el {fecha_legible} (hora {TIMEZONE})."
+        "mensaje_para_cliente": mensaje
     }), 201
 
 if __name__ == "__main__":
