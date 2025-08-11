@@ -111,6 +111,21 @@ def _get_session(session_id: str):
 
 
 # =========================
+# Helper: detectar si es probable que el mensaje sea un NOMBRE
+# =========================
+def is_probable_name(text: str) -> bool:
+    if not text:
+        return False
+    t = text.strip()
+    if any(ch.isdigit() for ch in t):
+        return False
+    if len(t) > 60:
+        return False
+    # Acepta letras (con acentos), espacios, guiones y apóstrofes, hasta 4 palabras
+    return bool(re.fullmatch(r"[A-Za-zÁÉÍÓÚáéíóúÑñÜü'´`-]+(?:\s+[A-Za-zÁÉÍÓÚáéíóúÑñÜü'´`-]+){0,3}", t))
+
+
+# =========================
 # HTML: Chat Web (solo nombre + fecha + hora)
 # =========================
 CHAT_HTML = """
@@ -494,10 +509,10 @@ def llm_orchestrate(history, slots, awaiting_confirm, candidate, user_message):
     messages.append({"role": "user", "content": user_message})
     messages.append({"role": "system", "content": "Devuelve SOLO el JSON indicado, sin texto adicional."})
 
-    # ✅ Manejo robusto de errores del LLM
+    # Manejo robusto de errores del LLM
     try:
         resp = oa_client.chat.completions.create(model=OPENAI_MODEL, temperature=0.3, messages=messages)
-        raw = (resp.choices[0].message.content or "").trim()
+        raw = (resp.choices[0].message.content or "").strip()
     except Exception:
         raw = ""
 
@@ -517,10 +532,11 @@ def llm_orchestrate(history, slots, awaiting_confirm, candidate, user_message):
             if isinstance(v, str):
                 data["candidate"][k] = v.strip()
 
-    # ✅ Nunca devolver reply vacío
+    # Nunca devolver reply vacío
     if not data["reply"]:
         data["reply"] = FALLBACK_REPLY
     return data
+
 
 def process_chat(session_id: str, user_msg: str, wa_id: str | None = None):
     session = _get_session(session_id)
@@ -531,6 +547,53 @@ def process_chat(session_id: str, user_msg: str, wa_id: str | None = None):
     if not user_msg:
         return {"reply": GREETING_TEXT, "done": False}
 
+    # ---- FAST PATH 1: si parece un NOMBRE y aún no lo tenemos, lo tomamos y pedimos fecha/hora
+    if not slots.get("nombre") and is_probable_name(user_msg):
+        slots["nombre"] = user_msg.strip().title()
+        reply = f"Gracias, {slots['nombre']}. ¿Qué día y hora te acomoda? (ej: 12/08 18:00)"
+        history += [{"role": "user", "content": user_msg}, {"role": "assistant", "content": reply}]
+        return {"reply": reply, "done": False}
+
+    # ---- FAST PATH 2: si ya tenemos NOMBRE y el mensaje parece FECHA/HORA, intentamos crear
+    if slots.get("nombre"):
+        dt_try = parse_datetime_es({"datetime_text": user_msg})
+        if dt_try:
+            start_dt = dt_try
+            end_dt = start_dt + timedelta(minutes=CLASS_DURATION_MIN)
+            ok_hours, msg_hours = within_class_hours(start_dt, end_dt)
+            if not ok_hours:
+                history += [{"role": "user", "content": user_msg}, {"role": "assistant", "content": msg_hours}]
+                return {"reply": msg_hours, "done": False}
+
+            ev, msg = enroll_in_class(
+                nombre=slots["nombre"],
+                start_dt=start_dt,
+                end_dt=end_dt,
+                capacidad=None,
+                titulo=None,
+                wa_id=wa_id
+            )
+            if not ev:
+                history += [{"role": "user", "content": user_msg}, {"role": "assistant", "content": msg}]
+                return {"reply": msg, "done": False}
+
+            session["last_event_id"] = ev.get("id")
+            # reset slots tras inscribir
+            session["slots"] = {"nombre":"", "datetime_text":"", "fecha":"", "hora":""}
+            session["awaiting_confirm"] = False
+            session["candidate"] = None
+
+            history += [{"role": "user", "content": user_msg}, {"role": "assistant", "content": msg}]
+            return {"reply": msg, "done": True, "evento": {
+                "id": ev.get("id"),
+                "htmlLink": ev.get("htmlLink"),
+                "start": ev.get("start"),
+                "end": ev.get("end"),
+                "icsUrl": ev.get("icsUrl"),
+                "gcalAddUrl": ev.get("gcalAddUrl"),
+            }}
+
+    # ---- Si no tomó FAST PATH, usamos el LLM (con fallback amable siempre)
     plan = llm_orchestrate(history, slots, awaiting_confirm, session.get("candidate"), user_msg)
 
     new_slots = plan.get("slots", {})
@@ -538,8 +601,8 @@ def process_chat(session_id: str, user_msg: str, wa_id: str | None = None):
         if new_slots.get(k):
             slots[k] = new_slots[k]
 
-    action = plan.get("next_action", "none")
-    reply  = plan.get("reply") or GREETING_TEXT
+    action = plan.get("next_action", "ask_missing")
+    reply  = plan.get("reply") or FALLBACK_REPLY
     cand   = plan.get("candidate") or {}
 
     if action == "confirm_time":
@@ -561,7 +624,6 @@ def process_chat(session_id: str, user_msg: str, wa_id: str | None = None):
             "fecha": cand.get("fecha") or slots.get("fecha"),
             "hora": cand.get("hora") or slots.get("hora"),
         }
-        # Parse fecha/hora
         start_dt = parse_datetime_es({
             "datetime_text": cand_or_slots["datetime_text"],
             "fecha": cand_or_slots["fecha"],
@@ -578,7 +640,6 @@ def process_chat(session_id: str, user_msg: str, wa_id: str | None = None):
             history += [{"role":"user","content":user_msg},{"role":"assistant","content":msg_hours}]
             return {"reply": msg_hours, "done": False}
 
-        # Inscribir (múltiples por evento) — pasamos wa_id para dedupe
         ev, msg = enroll_in_class(
             nombre=cand_or_slots["nombre"],
             start_dt=start_dt,
@@ -592,8 +653,6 @@ def process_chat(session_id: str, user_msg: str, wa_id: str | None = None):
             return {"reply": msg, "done": False}
 
         session["last_event_id"] = ev.get("id")
-
-        # Reset de slots
         session["slots"] = {"nombre":"", "datetime_text":"", "fecha":"", "hora":""}
         session["awaiting_confirm"] = False
         session["candidate"] = None
@@ -778,7 +837,7 @@ def wa_incoming():
             url = f"https://graph.facebook.com/v20.0/{phone_id}/messages"
             headers = {"Authorization": f"Bearer {WA_TOKEN}", "Content-Type": "application/json"}
 
-            # ✅ Nunca enviar "..." si algo falló
+            # Nunca enviar "..." si algo falló
             safe_reply = (res.get("reply") or "").strip() if isinstance(res, dict) else ""
             if not safe_reply:
                 safe_reply = FALLBACK_REPLY
