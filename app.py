@@ -310,7 +310,6 @@ def build_event_payload(nombre, start_dt, end_dt, telefono="", email="", comenta
         "description": "\n".join(description_lines),
         "start": {"dateTime": start_dt.isoformat(), "timeZone": TIMEZONE},
         "end": {"dateTime": end_dt.isoformat(), "timeZone": TIMEZONE},
-        # Sin conferenceData: es una llamada telefónica
     }
 
 def format_confirmation_message(nombre: str, start_dt, telefono: str | None):
@@ -355,6 +354,71 @@ def create_event_calendar(nombre, datetime_text=None, fecha=None, hora=None,
     created["telefono"] = telefono
     created["email"] = email
     return created, msg
+
+# --- EDITAR / ELIMINAR EVENTOS EN GOOGLE CALENDAR ---
+def update_event_calendar(event_id: str,
+                          nombre: str | None = None,
+                          datetime_text: str | None = None,
+                          fecha: str | None = None,
+                          hora: str | None = None,
+                          telefono: str | None = None,
+                          email: str | None = None,
+                          comentario: str | None = None):
+    """Actualiza campos de la cita. Si llega fecha/hora, reprograma a 30 min."""
+    try:
+        ev = gc_service.events().get(calendarId=CALENDAR_ID, eventId=event_id).execute()
+    except HttpError:
+        return None, f"No encontré la cita ({event_id})."
+
+    # 1) Reprogramar si llega nueva fecha/hora
+    if any([datetime_text, fecha, hora]):
+        start_dt = parse_datetime_es({
+            "datetime_text": (datetime_text or ""),
+            "fecha": (fecha or ""),
+            "hora": (hora or "")
+        })
+        if not start_dt:
+            return None, "No entendí la nueva fecha/hora. Ej: 12/08 13:00."
+        end_dt = start_dt + timedelta(minutes=30)
+        ev["start"] = {"dateTime": start_dt.isoformat(), "timeZone": TIMEZONE}
+        ev["end"]   = {"dateTime": end_dt.isoformat(),   "timeZone": TIMEZONE}
+
+    # 2) Cambiar nombre (summary)
+    if nombre:
+        ev["summary"] = f"Llamada con {nombre}"
+
+    # 3) (Re)construir descripción si llega alguno de estos campos
+    touched_contact = any(v is not None for v in [telefono, email, comentario, nombre])
+    if touched_contact:
+        # Usa los valores nuevos si vienen, si no, intenta conservar lo actual
+        desc_prev = ev.get("description") or ""
+        def pick(label, nuevo):
+            if nuevo is not None and nuevo != "":
+                return nuevo
+            m = re.search(fr"{label}:\s*(.+)", desc_prev)
+            return (m.group(1).strip() if m else "")
+        nombre_desc   = nombre or (re.sub(r"^Llamada con\s*", "", ev.get("summary","")) or "Cliente")
+        telefono_desc = pick("Teléfono", telefono)
+        email_desc    = pick("Email", email)
+        coment_desc   = pick("Comentario", comentario)
+
+        lines = ["Tipo: Llamada saliente", f"Nombre: {nombre_desc}"]
+        if telefono_desc: lines.append(f"Teléfono: {telefono_desc}")
+        if email_desc:    lines.append(f"Email: {email_desc}")
+        if coment_desc:   lines.append(f"Comentario: {coment_desc}")
+        ev["description"] = "\n".join(lines)
+
+    # 4) Guardar cambios
+    updated = gc_service.events().update(calendarId=CALENDAR_ID, eventId=event_id, body=ev).execute()
+    return updated, "Cita actualizada correctamente."
+
+def delete_event_calendar(event_id: str):
+    """Elimina la cita."""
+    try:
+        gc_service.events().delete(calendarId=CALENDAR_ID, eventId=event_id, sendUpdates="none").execute()
+        return True, "Cita eliminada."
+    except HttpError:
+        return False, f"No pude eliminar la cita ({event_id})."
 
 # =========================
 # Rutas básicas / formulario
@@ -475,6 +539,37 @@ def crear_cita_api():
         },
         "mensaje_para_cliente": msg
     }), 201
+
+# PATCH /cita/<id>  (editar)
+@app.patch("/cita/<event_id>")
+def editar_cita(event_id):
+    data = request.get_json(silent=True) or {}
+    updated, msg = update_event_calendar(
+        event_id=event_id,
+        nombre=data.get("nombre"),
+        datetime_text=data.get("datetime_text"),
+        fecha=data.get("fecha"),
+        hora=data.get("hora"),
+        telefono=data.get("telefono"),
+        email=data.get("email"),
+        comentario=data.get("comentario"),
+    )
+    if not updated:
+        return jsonify({"ok": False, "error": msg}), 400
+    return jsonify({"ok": True, "mensaje": msg, "evento": {
+        "id": updated.get("id"),
+        "htmlLink": updated.get("htmlLink"),
+        "start": updated.get("start"),
+        "end": updated.get("end"),
+    }}), 200
+
+# DELETE /cita/<id>  (eliminar)
+@app.delete("/cita/<event_id>")
+def eliminar_cita(event_id):
+    ok, msg = delete_event_calendar(event_id)
+    if not ok:
+        return jsonify({"ok": False, "error": msg}), 400
+    return jsonify({"ok": True, "mensaje": msg}), 200
 
 # =========================
 # Chatbot con GPT 3.5 — Orquestación conversacional
