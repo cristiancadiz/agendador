@@ -18,10 +18,9 @@ if not os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON"):
 if not CALENDAR_ID:
     raise Exception("Falta GOOGLE_CALENDAR_ID en variables de entorno.")
 
-# ====== Calendar Client ======
+# ====== Google Calendar client ======
 SCOPES = ["https://www.googleapis.com/auth/calendar"]
-raw = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")
-info = json.loads(raw)
+info = json.loads(os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON"))
 creds = Credentials.from_service_account_info(info, scopes=SCOPES)
 service = build("calendar", "v3", credentials=creds, cache_discovery=False)
 
@@ -29,30 +28,29 @@ service = build("calendar", "v3", credentials=creds, cache_discovery=False)
 app = Flask(__name__)
 
 def parse_datetime_es(payload: dict):
-    """Parsea fecha/hora en español a datetime consciente de zona."""
     settings = {
         "PREFER_DATES_FROM": "future",
         "RETURN_AS_TIMEZONE_AWARE": True,
         "TIMEZONE": TIMEZONE,
     }
+    # Texto natural: "mañana a las 13:00"
     dt_text = payload.get("datetime_text")
     if dt_text:
         dt = dateparser.parse(dt_text, languages=["es"], settings=settings)
         if dt:
             return dt
-
+    # Fecha + hora separadas
     fecha = payload.get("fecha")
     hora = payload.get("hora")
     if fecha and hora:
         dt = dateparser.parse(f"{fecha} {hora}", languages=["es"], settings=settings)
         if dt:
             return dt
-
+    # Solo fecha (default 10:00)
     if fecha and not hora:
         dt = dateparser.parse(f"{fecha} 10:00", languages=["es"], settings=settings)
         if dt:
             return dt
-
     return None
 
 @app.get("/")
@@ -61,7 +59,6 @@ def health():
 
 @app.get("/_diag")
 def diag():
-    """Diagnóstico mínimo para revisar configuración."""
     return jsonify({
         "ok": True,
         "calendar_id": CALENDAR_ID,
@@ -71,19 +68,17 @@ def diag():
 
 @app.post("/cita")
 def crear_cita():
-    """Crea una cita en Google Calendar (o preview si 'dry_run': true)."""
+    """Crea una cita en Google Calendar (sin invitados/correos)."""
     data = request.get_json(silent=True) or {}
 
     nombre = (data.get("nombre") or "Cliente").strip()
     duracion = int(data.get("duracion_minutos") or 30)
-    email = (data.get("email") or "").strip()
     telefono = (data.get("telefono") or "").strip()
     comentario = (data.get("comentario") or "").strip()
-    dry_run = bool(data.get("dry_run"))
 
     start_dt = parse_datetime_es(data)
     if not start_dt:
-        return jsonify({"ok": False, "where": "parse_datetime", "error": "No pude entender la fecha/hora."}), 400
+        return jsonify({"ok": False, "error": "No pude entender la fecha/hora."}), 400
 
     end_dt = start_dt + timedelta(minutes=duracion)
 
@@ -93,33 +88,19 @@ def crear_cita():
     if comentario:
         description_items.append(f"Comentario: {comentario}")
 
-    attendees = []
-    if email:
-        attendees.append({"email": email})
-
     event_body = {
         "summary": f"Cita con {nombre}",
         "description": "\n".join(description_items),
         "start": {"dateTime": start_dt.isoformat(), "timeZone": TIMEZONE},
         "end": {"dateTime": end_dt.isoformat(), "timeZone": TIMEZONE},
+        # Sin 'attendees' para evitar 403 forbiddenForServiceAccounts
     }
-    if attendees:
-        event_body["attendees"] = attendees
-
-    if dry_run:
-        fecha_legible = start_dt.strftime("%d-%m-%Y %H:%M")
-        return jsonify({
-            "ok": True,
-            "dry_run": True,
-            "evento_preview": event_body,
-            "mensaje_para_cliente": f"[PREVIEW] {nombre}, tu cita sería el {fecha_legible} (hora {TIMEZONE})."
-        })
 
     try:
         created = service.events().insert(
             calendarId=CALENDAR_ID,
             body=event_body,
-            sendUpdates="all",
+            sendUpdates="none",   # no envía correos
         ).execute()
     except HttpError as e:
         status = getattr(e, "status_code", None) or (getattr(e, "resp", None).status if getattr(e, "resp", None) else 500)
@@ -135,11 +116,7 @@ def crear_cita():
             "details": detail
         }), 502
     except Exception as e:
-        return jsonify({
-            "ok": False,
-            "where": "unexpected",
-            "error": f"{type(e).__name__}: {e}"
-        }), 500
+        return jsonify({"ok": False, "where": "unexpected", "error": f"{type(e).__name__}: {e}"}), 500
 
     fecha_legible = start_dt.strftime("%d-%m-%Y %H:%M")
     return jsonify({
@@ -150,78 +127,13 @@ def crear_cita():
             "start": created.get("start"),
             "end": created.get("end"),
         },
-        "mensaje_para_cliente": (
-            f"Listo {nombre}, tu cita quedó solicitada para el {fecha_legible} (hora {TIMEZONE})."
-            + (" Revisa tu correo para la invitación." if email else "")
-        )
+        "mensaje_para_cliente": f"Listo {nombre}, tu cita quedó solicitada para el {fecha_legible} (hora {TIMEZONE})."
     }), 201
 
 if __name__ == "__main__":
     import argparse
-
-    parser = argparse.ArgumentParser(description="Bot de Citas - servidor y pruebas (con diag y dry-run)")
-    parser.add_argument("--runserver", action="store_true", help="Levanta el servidor Flask localmente")
-    parser.add_argument("--test", action="store_true", help="Ejecuta una prueba contra el endpoint /cita")
-    parser.add_argument("--url", default=os.getenv("BOT_URL", "http://localhost:8000/cita"),
-                        help="URL del endpoint /cita (por defecto BOT_URL o http://localhost:8000/cita)")
-    parser.add_argument("--modo", choices=["natural", "separado"], default="natural",
-                        help="Modo de envío de fecha/hora para la prueba")
-    parser.add_argument("--nombre", default="Cliente", help="Nombre del cliente para la prueba")
-    parser.add_argument("--texto", help="Texto natural (ej. 'mañana a las 13:00')")
-    parser.add_argument("--fecha", help="Fecha YYYY-MM-DD (modo 'separado')")
-    parser.add_argument("--hora", help="Hora HH:MM 24h (modo 'separado')")
-    parser.add_argument("--duracion", type=int, default=30, help="Duración en minutos (default 30)")
-    parser.add_argument("--email", help="Email del cliente (opcional)")
-    parser.add_argument("--telefono", help="Teléfono del cliente (opcional)")
-    parser.add_argument("--comentario", help="Comentario/notas (opcional)")
-    parser.add_argument("--dry_run", action="store_true", help="No inserta en Google; solo preview")
-
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--runserver", action="store_true")
     args = parser.parse_args()
-
     if args.runserver:
-        port = int(os.getenv("PORT", 8000))
-        app.run(host="0.0.0.0", port=port)
-
-    elif args.test:
-        try:
-            import requests
-        except ImportError:
-            raise SystemExit("Para usar --test instala requests: pip install requests")
-
-        payload = {
-            "nombre": args.nombre,
-            "duracion_minutos": args.duracion,
-        }
-        if args.email:
-            payload["email"] = args.email
-        if args.telefono:
-            payload["telefono"] = args.telefono
-        if args.comentario:
-            payload["comentario"] = args.comentario
-        if args.dry_run:
-            payload["dry_run"] = True
-
-        if args.modo == "natural":
-            if not args.texto:
-                raise SystemExit("En modo 'natural' debes pasar --texto (ej. 'mañana a las 13:00')")
-            payload["datetime_text"] = args.texto
-        else:
-            if not (args.fecha and args.hora):
-                raise SystemExit("En modo 'separado' debes pasar --fecha YYYY-MM-DD y --hora HH:MM")
-            payload["fecha"] = args.fecha
-            payload["hora"] = args.hora
-
-        print("→ POST", args.url)
-        print("→ Payload:", json.dumps(payload, ensure_ascii=False))
-        try:
-            resp = requests.post(args.url, json=payload, timeout=30)
-        except Exception as e:
-            raise SystemExit(f"Error de red: {e}")
-
-        print("← Status:", resp.status_code)
-        try:
-            print(json.dumps(resp.json(), indent=2, ensure_ascii=False))
-        except ValueError:
-            print(resp.text)
-    else:
-        parser.print_help()
+        app.run(host="0.0.0.0", port=int(os.getenv("PORT", 8000)))
