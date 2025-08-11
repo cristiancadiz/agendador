@@ -27,7 +27,14 @@ CALENDAR_ID = os.getenv("GOOGLE_CALENDAR_ID")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 OPENAI_MODEL = "gpt-3.5-turbo"  # fijo
 
-# WhatsApp Cloud API (opcional, pero si lo usas deben existir)
+# Identidad de la empresa y saludo formal (con emoji)
+COMPANY_NAME = os.getenv("COMPANY_NAME", "Departamento de Cobranza")
+GREETING_TEXT = os.getenv(
+    "GREETING_TEXT",
+    f"Hola 👋, somos {COMPANY_NAME}. Le ayudaremos a agendar una cita. ¿Podría indicarme su nombre, por favor?"
+)
+
+# WhatsApp Cloud API (opcional)
 WA_TOKEN = os.getenv("WA_TOKEN")
 WA_PHONE_ID = os.getenv("WA_PHONE_ID")
 WA_VERIFY_TOKEN = os.getenv("WA_VERIFY_TOKEN", "verify_me")
@@ -102,11 +109,11 @@ CHAT_HTML = """
       </div>
       <div id="chat" class="chat"></div>
       <div class="foot">
-        <textarea id="box" placeholder="Escribe aquí… (Enter para enviar, Shift+Enter para salto)"></textarea>
+        <textarea id="box" placeholder="Escriba aquí… (Enter para enviar, Shift+Enter para salto)"></textarea>
         <button id="send">Enviar</button>
       </div>
     </div>
-    <p class="hint" style="margin-left:6px">Si prefieres formulario: <a href="/nuevo">agendar con formulario</a></p>
+    <p class="hint" style="margin-left:6px">Si prefiere formulario: <a href="/nuevo">agendar con formulario</a></p>
   </div>
 
 <script>
@@ -166,7 +173,7 @@ async function callBot(text){
     body: JSON.stringify(payload)
   });
   if (!resp.ok) {
-    addMsg('Ups, no pude procesar ahora (' + resp.status + '). Intenta de nuevo.', 'bot');
+    addMsg('No he podido procesar su solicitud en este momento (' + resp.status + '). Intente nuevamente, por favor.', 'bot');
     return;
   }
   const data = await resp.json();
@@ -189,8 +196,8 @@ box.addEventListener('keydown', (e)=>{
   if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendNow(); }
 });
 
-// Mensaje inicial
-addMsg('¡Hola! ¿Para qué fecha y hora quieres la cita? (ej: “12/08 a las 14:00”). Dime también tu nombre.');
+// Mensaje inicial (seguro con tojson)
+addMsg({{ greeting|tojson }});
 </script>
 </body>
 </html>
@@ -270,6 +277,18 @@ def build_event_payload(nombre, start_dt, end_dt, telefono="", comentario=""):
         "conferenceData": {"createRequest": {"requestId": str(uuid4())}},  # Meet
     }
 
+def format_confirmation_message(nombre: str, start_dt, meet_link: str | None) -> str:
+    fecha_legible = start_dt.strftime("%d-%m-%Y %H:%M")
+    base = (
+        f"{COMPANY_NAME} — "
+        f"Estimado/a {nombre}, su reunión ha sido agendada para el {fecha_legible} "
+        f"(horario {TIMEZONE}). Duración: 30 minutos."
+    )
+    if meet_link:
+        base += f" Enlace de videollamada: {meet_link}"
+    base += " Si requiere reprogramar o cancelar, responda a este mismo medio."
+    return base
+
 def create_event_calendar(nombre, datetime_text=None, fecha=None, hora=None,
                           telefono="", comentario="", allow_date_only=False):
     """Crea evento (30 min) + Meet. Devuelve (evento, mensaje o error)."""
@@ -278,7 +297,7 @@ def create_event_calendar(nombre, datetime_text=None, fecha=None, hora=None,
         "_allow_date_only": allow_date_only
     })
     if not start_dt:
-        return None, "Necesito fecha y hora exacta (ej: 12/08 14:00)."
+        return None, "Para agendar necesito la fecha y la hora exactas (ejemplo: 12/08 14:00)."
 
     end_dt = start_dt + timedelta(minutes=30)
     event_body = build_event_payload(nombre or "Cliente", start_dt, end_dt, telefono, comentario)
@@ -302,11 +321,7 @@ def create_event_calendar(nombre, datetime_text=None, fecha=None, hora=None,
                  or (created.get("conferenceData", {})
                      .get("entryPoints", [{}])[0]
                      .get("uri")))
-    fecha_legible = start_dt.strftime("%d-%m-%Y %H:%M")
-    msg = f"Listo {nombre or 'Cliente'}, tu cita quedó para el {fecha_legible} (hora {TIMEZONE})."
-    if meet_link:
-        msg += f" Enlace Meet: {meet_link}"
-
+    msg = format_confirmation_message(nombre or "Cliente", start_dt, meet_link)
     created["meet_link"] = meet_link
     return created, msg
 
@@ -326,17 +341,22 @@ def diag():
         "service_account_email": info.get("client_email"),
     })
 
+# (Opcional) listar rutas para debug
+@app.get("/_routes")
+def list_routes():
+    return jsonify(sorted([str(r) for r in app.url_map.iter_rules()]))
+
 FORM_HTML = """
 <!doctype html><html lang="es"><head><meta charset="utf-8"><title>Agendar</title></head>
 <body style="font-family:system-ui;max-width:720px;margin:24px auto">
   <h1>Agendar (formulario)</h1>
   <form method="post" action="/nuevo">
-    <label>Nombre</label><br><input name="nombre" placeholder="Pilar" required><br><br>
+    <label>Nombre</label><br><input name="nombre" placeholder="Juan Pérez" required><br><br>
     <label>Fecha (YYYY-MM-DD)</label><br><input name="fecha" type="date"><br><br>
     <label>Hora (HH:MM)</label><br><input name="hora" type="time"><br><br>
     <label>O texto natural</label><br><input name="datetime_text" placeholder="12/08 a las 14:00"><br><br>
     <label>Teléfono (opcional)</label><br><input name="telefono" placeholder="+569..."><br><br>
-    <label>Comentario (opcional)</label><br><input name="comentario" placeholder="Asesoría"><br><br>
+    <label>Comentario (opcional)</label><br><input name="comentario" placeholder="Motivo de la reunión"><br><br>
     <button type="submit">Crear</button>
   </form>
   <p>Zona: {{ tz }} — Calendario: <code>{{ cal }}</code></p>
@@ -346,7 +366,7 @@ FORM_HTML = """
 RESULT_HTML = """
 <!doctype html><html lang="es"><head><meta charset="utf-8"><title>Cita creada</title></head>
 <body style="font-family:system-ui;max-width:720px;margin:24px auto">
-  <h1>✅ Cita creada</h1>
+  <h1>✅ Reunión agendada</h1>
   <p>{{ mensaje }}</p>
   <ul>
     <li><b>Inicio:</b> {{ start_dt }}</li>
@@ -390,7 +410,7 @@ def crear_cita_web():
 
 @app.get("/chat")
 def chat_ui():
-    return render_template_string(CHAT_HTML, tz=TIMEZONE, cal=CALENDAR_ID)
+    return render_template_string(CHAT_HTML, tz=TIMEZONE, cal=CALENDAR_ID, greeting=GREETING_TEXT)
 
 # =========================
 # Endpoint JSON directo
@@ -421,12 +441,14 @@ def crear_cita_api():
     }), 201
 
 # =========================
-# Chatbot con GPT 3.5 (slot-filling robusto)
+# Chatbot con GPT 3.5 (formal)
 # =========================
 SYSTEM_PROMPT = (
-    "Eres un asistente para agendar citas (Chile). "
-    "Objetivo: obtener NOMBRE y FECHA/HORA. Duración fija: 30 minutos. "
-    "No inventes datos. Si el último mensaje del usuario NO trae un valor, déjalo vacío."
+    "Usted es el asistente de agenda de una empresa de cobranza judicial. "
+    "Comunicarse SIEMPRE en tono formal y profesional (trato de 'usted'), sin emoticonos. "
+    "Objetivo: obtener NOMBRE COMPLETO y FECHA/HORA para una reunión de 30 minutos. "
+    "No invente datos; si el mensaje del usuario no contiene un valor, deje ese campo vacío. "
+    "Haga como máximo UNA pregunta breve y clara cuando falte información."
 )
 
 def _get_session(session_id: str):
@@ -442,9 +464,9 @@ def gpt_extract_fields(history, user_message):
     messages += history
     messages.append({"role": "user", "content": user_message})
     instruction = (
-        "Devuelve SOLO este JSON, con valores extraídos EXCLUSIVAMENTE del último mensaje del usuario. "
-        "Si un valor no aparece en el último mensaje, déjalo vacío ('').\n"
-        "{ \"nombre\":\"\", \"datetime_text\":\"\", \"fecha\":\"\", \"hora\":\"\" }\n"
+        "Devuelva SOLO este JSON, con valores extraídos EXCLUSIVAMENTE del último mensaje del usuario. "
+        "Si un valor no aparece en el último mensaje, déjelo vacío (''). "
+        "{ \"nombre\":\"\", \"datetime_text\":\"\", \"fecha\":\"\", \"hora\":\"\" } "
         "Nada de texto fuera del JSON."
     )
     messages.append({"role": "system", "content": instruction})
@@ -469,7 +491,7 @@ def process_chat(session_id: str, user_msg: str, telefono: str = "", comentario:
     slots = session["slots"]
 
     if not user_msg:
-        return {"reply": "Cuéntame tu nombre y para qué fecha y hora quieres agendar.", "done": False}
+        return {"reply": GREETING_TEXT, "done": False}
 
     extracted = gpt_extract_fields(history, user_msg)
     for k in ["nombre", "datetime_text", "fecha", "hora"]:
@@ -481,12 +503,12 @@ def process_chat(session_id: str, user_msg: str, telefono: str = "", comentario:
     have_fecha_hora = bool(slots["fecha"]) and bool(slots["hora"])
 
     if not have_nombre:
-        reply = "¿Cuál es tu nombre?"
+        reply = "¿Podría indicarme su nombre y apellido, por favor?"
         history += [{"role": "user", "content": user_msg}, {"role": "assistant", "content": reply}]
         return {"reply": reply, "done": False}
 
     if not (have_time_from_text or have_fecha_hora):
-        reply = "¿Para qué fecha y hora quieres la cita? (ej: 12/08 14:00)"
+        reply = "¿Podría indicarme la fecha y la hora deseadas para la reunión? (ejemplo: 12/08 14:00)."
         history += [{"role": "user", "content": user_msg}, {"role": "assistant", "content": reply}]
         return {"reply": reply, "done": False}
 
@@ -500,7 +522,7 @@ def process_chat(session_id: str, user_msg: str, telefono: str = "", comentario:
     )
 
     if not created:
-        reply = "No pude entender la fecha/hora. ¿Confirmas fecha (DD/MM o YYYY-MM-DD) y hora (HH:MM 24h)?"
+        reply = "No he podido interpretar la fecha y hora. ¿Me las confirma en formato DD/MM o YYYY-MM-DD y HH:MM (24 h), por favor?"
         history += [{"role": "user", "content": user_msg}, {"role": "assistant", "content": reply}]
         return {"reply": reply, "done": False}
 
