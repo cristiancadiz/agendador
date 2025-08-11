@@ -39,7 +39,7 @@ WA_TOKEN = os.getenv("WA_TOKEN")
 WA_PHONE_ID = os.getenv("WA_PHONE_ID")
 WA_VERIFY_TOKEN = os.getenv("WA_VERIFY_TOKEN", "verify_me")
 
-# Debug WA
+# Debug WA (logs de entrada/salida)
 DEBUG_WA = os.getenv("DEBUG_WA", "0") == "1"
 
 if not os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON"):
@@ -63,10 +63,10 @@ app = Flask(__name__)
 
 # Estado por sesión:
 # { session_id: {
-#     "history":[...],
+#     "history":[...],                         # turns previos (texto natural)
 #     "slots":{"nombre","datetime_text","fecha","hora"},
-#     "awaiting_confirm": bool,
-#     "candidate": {...}  # datos propuestos para confirmar
+#     "awaiting_confirm": bool,                # si estamos esperando "sí/no"
+#     "candidate": {...}                       # propuesta de fecha/hora a confirmar
 # } }
 SESSIONS = {}
 
@@ -397,7 +397,7 @@ def crear_cita_web():
         hora=form.get("hora"),
         telefono=form.get("telefono"),
         comentario=form.get("comentario"),
-        allow_date_only=True,
+        allow_date_only=True,  # permite solo fecha (default 10:00) en formulario
     )
     if not created:
         return msg, 400
@@ -445,14 +445,24 @@ def crear_cita_api():
     }), 201
 
 # =========================
-# Chatbot con GPT 3.5 (conversacional + confirmación)
+# Chatbot con GPT 3.5 — Orquestación conversacional
 # =========================
 SYSTEM_PROMPT = (
     "Eres el asistente de agenda de una empresa de cobranza judicial. "
-    "Habla en tono cercano y profesional, de tú (conversacional, claro, sin rodeos). "
-    "Objetivo: obtener NOMBRE y FECHA/HORA para una reunión de 30 minutos. "
-    "No inventes datos; si el mensaje no trae un valor, deja ese campo vacío. "
-    "Haz como máximo UNA pregunta breve cuando falte información."
+    "Habla en tono cercano, claro y profesional (de tú). "
+    "Objetivo: conseguir NOMBRE y FECHA/HORA para una reunión de 30 minutos y crearla cuando el usuario confirme. "
+    "Responde siempre con naturalidad (una o dos frases). No repitas lo que el usuario dice palabra por palabra. "
+    "Además de tu respuesta, devuelve una estructura JSON con: "
+    "  reply: tu respuesta natural para el usuario, "
+    "  slots: {nombre, datetime_text, fecha, hora} con lo que DETECTES EN EL ÚLTIMO MENSAJE, "
+    "  next_action: una de [smalltalk, ask_missing, confirm_time, create_event, none], "
+    "  candidate: (opcional) {datetime_text | fecha+hora} cuando propongas/confirmes una hora. "
+    "Política: "
+    "- Si el usuario habla de otra cosa, contesta brevemente y redirige amable a agendar (smalltalk). "
+    "- Si falta nombre u hora/fecha, pide SOLO lo que falta (ask_missing). "
+    "- Si el usuario dio nombre y hora/fecha, propone y pide confirmación (confirm_time). "
+    "- Solo marca create_event cuando el usuario ha confirmado de forma clara. "
+    "- No inventes datos."
 )
 
 def _get_session(session_id: str):
@@ -467,153 +477,107 @@ def _get_session(session_id: str):
         SESSIONS[session_id] = s
     return s
 
-def gpt_extract_fields(history, user_message):
-    """Extrae SOLO del último mensaje del usuario."""
-    messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+def llm_orchestrate(history, slots, awaiting_confirm, candidate, user_message):
+    # Contexto breve para el modelo
+    state = {
+        "slots": slots,
+        "awaiting_confirm": awaiting_confirm,
+        "candidate": candidate or {}
+    }
+    messages = [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "system", "content": f"Estado actual: {json.dumps(state, ensure_ascii=False)}"},
+    ]
     messages += history
     messages.append({"role": "user", "content": user_message})
-    instruction = (
-        "Devuelve SOLO este JSON con valores extraídos EXCLUSIVAMENTE del último mensaje del usuario. "
-        "{ \"nombre\":\"\", \"datetime_text\":\"\", \"fecha\":\"\", \"hora\":\"\" } "
-        "Si un valor no aparece, déjalo vacío. Nada fuera del JSON."
-    )
-    messages.append({"role": "system", "content": instruction})
+    messages.append({"role": "system", "content":
+        "Devuelve SOLO un JSON con este esquema: "
+        "{ \"reply\":\"...\", "
+        "  \"slots\": {\"nombre\":\"\", \"datetime_text\":\"\", \"fecha\":\"\", \"hora\":\"\"}, "
+        "  \"next_action\":\"smalltalk|ask_missing|confirm_time|create_event|none\", "
+        "  \"candidate\": {\"datetime_text\":\"\"} ó {\"fecha\":\"\", \"hora\":\"\"} "
+        "} "
+        "No agregues texto fuera del JSON."
+    })
+
     resp = oa_client.chat.completions.create(
-        model=OPENAI_MODEL, temperature=0, messages=messages
+        model=OPENAI_MODEL, temperature=0.3, messages=messages
     )
-    content = resp.choices[0].message.content or "{}"
+    raw = resp.choices[0].message.content or "{}"
     try:
-        data = json.loads(content)
+        data = json.loads(raw)
     except Exception:
-        data = {"nombre":"", "datetime_text":"", "fecha":"", "hora":""}
-    for k in ["nombre", "datetime_text", "fecha", "hora"]:
-        data.setdefault(k, "")
-        if isinstance(data[k], str):
-            data[k] = data[k].strip()
+        data = {"reply": "Perdona, no te entendí bien. ¿Me dices tu nombre y una fecha/hora? (ej: 12/08 14:00)",
+                "slots": {"nombre":"", "datetime_text":"", "fecha":"", "hora":""},
+                "next_action": "ask_missing"}
+    # Normaliza
+    data.setdefault("reply", "")
+    data.setdefault("slots", {"nombre":"", "datetime_text":"", "fecha":"", "hora":""})
+    data.setdefault("next_action", "none")
+    if "candidate" in data and isinstance(data["candidate"], dict):
+        for k, v in list(data["candidate"].items()):
+            if isinstance(v, str):
+                data["candidate"][k] = v.strip()
     return data
-
-def _is_yes(text: str) -> bool:
-    t = (text or "").strip().lower()
-    return any(pat in t for pat in [
-        "si", "sí", "ok", "vale", "dale", "confirmo", "confirmar",
-        "agenda", "agéndalo", "agendar", "está bien", "de acuerdo", "correcto", "listo"
-    ])
-
-def _is_no(text: str) -> bool:
-    t = (text or "").strip().lower()
-    return any(pat in t for pat in [
-        "no", "cambia", "cambiar", "otra", "otro", "modificar", "reprogramar", "cancelar", "mejor"
-    ])
-
-def _format_dt_for_confirm(nombre: str, dt):
-    fecha_legible = dt.strftime("%d-%m-%Y %H:%M")
-    return f"Perfecto {nombre}. ¿Confirmas que agendemos el {fecha_legible} (30 min)? Responde “sí” para agendar o “no” para cambiar."
 
 def process_chat(session_id: str, user_msg: str, telefono: str = "", comentario: str = ""):
     session = _get_session(session_id)
     history = session["history"]
     slots = session["slots"]
+    awaiting_confirm = session.get("awaiting_confirm", False)
+    candidate = session.get("candidate")
 
-    # 1) Si esperamos confirmación, evaluar sí/no o nueva fecha/hora
-    if session["awaiting_confirm"]:
-        # ¿Dijo sí?
-        if _is_yes(user_msg):
-            cand = session["candidate"] or {}
-            created, msg = create_event_calendar(
-                nombre=cand.get("nombre") or slots.get("nombre") or "Cliente",
-                datetime_text=cand.get("datetime_text"),
-                fecha=cand.get("fecha"),
-                hora=cand.get("hora"),
-                telefono=cand.get("telefono") or telefono,
-                comentario=cand.get("comentario") or comentario,
-            )
-            session["awaiting_confirm"] = False
-            session["candidate"] = None
-            if not created:
-                reply = "No me quedó clara la fecha/hora. ¿Me la confirmas en DD/MM o YYYY-MM-DD y HH:MM (24 h)?"
-                history += [{"role":"user","content":user_msg},{"role":"assistant","content":reply}]
-                return {"reply": reply, "done": False}
-            # limpiar slots para próxima cita
-            session["slots"] = {"nombre":"", "datetime_text":"", "fecha":"", "hora":""}
-            history += [{"role":"user","content":user_msg},{"role":"assistant","content":msg}]
-            return {"reply": msg, "done": True, "evento": created}
-
-        # ¿Dijo no?
-        if _is_no(user_msg):
-            session["awaiting_confirm"] = False
-            session["candidate"] = None
-            reply = "Sin problema. Dime otra fecha y hora (ejemplo: 12/08 14:00)."
-            history += [{"role":"user","content":user_msg},{"role":"assistant","content":reply}]
-            return {"reply": reply, "done": False}
-
-        # Si escribió algo que parece nueva fecha/hora, reintentar confirmación
-        extracted_try = gpt_extract_fields(history, user_msg)
-        new_dt = parse_datetime_es({
-            "datetime_text": extracted_try.get("datetime_text"),
-            "fecha": extracted_try.get("fecha"),
-            "hora": extracted_try.get("hora")
-        })
-        if new_dt:
-            nombre = slots.get("nombre") or extracted_try.get("nombre") or "Cliente"
-            session["candidate"] = {
-                "nombre": nombre,
-                "datetime_text": extracted_try.get("datetime_text"),
-                "fecha": extracted_try.get("fecha"),
-                "hora": extracted_try.get("hora"),
-                "telefono": telefono, "comentario": comentario
-            }
-            reply = _format_dt_for_confirm(nombre, new_dt)
-            history += [{"role":"user","content":user_msg},{"role":"assistant","content":reply}]
-            return {"reply": reply, "done": False}
-
-        # Si no entendí, repreguntar
-        reply = "¿Me confirmas con “sí” para agendar o “no” para cambiar la fecha/hora?"
-        history += [{"role":"user","content":user_msg},{"role":"assistant","content":reply}]
-        return {"reply": reply, "done": False}
-
-    # 2) Flujo normal
     if not user_msg:
         return {"reply": GREETING_TEXT, "done": False}
 
-    extracted = gpt_extract_fields(history, user_msg)
+    # 1) Orquestación por LLM
+    plan = llm_orchestrate(history, slots, awaiting_confirm, candidate, user_msg)
+
+    # 2) Fusiona slots con SOLO lo detectado ahora
+    new_slots = plan.get("slots", {})
     for k in ["nombre", "datetime_text", "fecha", "hora"]:
-        if extracted.get(k):
-            slots[k] = extracted[k]
+        if new_slots.get(k):
+            slots[k] = new_slots[k]
 
-    have_nombre = bool(slots["nombre"])
-    have_time_from_text = bool(slots["datetime_text"]) and _has_time_token(slots["datetime_text"])
-    have_fecha_hora = bool(slots["fecha"]) and bool(slots["hora"])
+    action = plan.get("next_action", "none")
+    reply  = plan.get("reply") or GREETING_TEXT
+    cand   = plan.get("candidate") or {}
 
-    if not have_nombre:
-        reply = "¿Cómo te llamas? (nombre y apellido)"
+    # 3) Ejecuta acciones mínimas según plan
+    if action == "confirm_time":
+        session["awaiting_confirm"] = True
+        cand_payload = {
+            "nombre": slots.get("nombre") or "Cliente",
+            "datetime_text": cand.get("datetime_text") or slots.get("datetime_text"),
+            "fecha": cand.get("fecha") or slots.get("fecha"),
+            "hora":  cand.get("hora")  or slots.get("hora"),
+            "telefono": telefono, "comentario": comentario
+        }
+        session["candidate"] = cand_payload
         history += [{"role":"user","content":user_msg},{"role":"assistant","content":reply}]
         return {"reply": reply, "done": False}
 
-    if not (have_time_from_text or have_fecha_hora):
-        reply = "¿Qué fecha y hora te acomodan? (ejemplo: 12/08 14:00)"
-        history += [{"role":"user","content":user_msg},{"role":"assistant","content":reply}]
-        return {"reply": reply, "done": False}
+    if action == "create_event":
+        nombre = (cand.get("nombre") or slots.get("nombre") or "Cliente").strip()
+        created, msg = create_event_calendar(
+            nombre=nombre,
+            datetime_text=cand.get("datetime_text") or slots.get("datetime_text"),
+            fecha=cand.get("fecha") or slots.get("fecha"),
+            hora=cand.get("hora") or slots.get("hora"),
+            telefono=telefono,
+            comentario=comentario,
+        )
+        session["awaiting_confirm"] = False
+        session["candidate"] = None
+        if not created:
+            reply = "No me quedó clara la fecha/hora. ¿Me la confirmas en DD/MM o YYYY-MM-DD y HH:MM (24 h)?"
+            history += [{"role":"user","content":user_msg},{"role":"assistant","content":reply}]
+            return {"reply": reply, "done": False}
+        session["slots"] = {"nombre":"", "datetime_text":"", "fecha":"", "hora":""}
+        history += [{"role":"user","content":user_msg},{"role":"assistant","content":msg}]
+        return {"reply": msg, "done": True, "evento": created}
 
-    # 3) Tenemos nombre y fecha/hora -> pedir confirmación con fecha normalizada
-    start_dt = parse_datetime_es({
-        "datetime_text": slots["datetime_text"] if have_time_from_text else None,
-        "fecha": slots["fecha"] if have_fecha_hora else None,
-        "hora": slots["hora"] if have_fecha_hora else None
-    })
-    if not start_dt:
-        reply = "No me quedó clara la fecha/hora. ¿Me la confirmas en DD/MM o YYYY-MM-DD y HH:MM (24 h)?"
-        history += [{"role":"user","content":user_msg},{"role":"assistant","content":reply}]
-        return {"reply": reply, "done": False}
-
-    session["awaiting_confirm"] = True
-    session["candidate"] = {
-        "nombre": slots["nombre"],
-        "datetime_text": slots["datetime_text"] if have_time_from_text else None,
-        "fecha": slots["fecha"] if have_fecha_hora else None,
-        "hora": slots["hora"] if have_fecha_hora else None,
-        "telefono": telefono, "comentario": comentario
-    }
-    reply = _format_dt_for_confirm(slots["nombre"], start_dt)
+    # smalltalk / ask_missing / none → responde conversacional y seguimos
     history += [{"role":"user","content":user_msg},{"role":"assistant","content":reply}]
     return {"reply": reply, "done": False}
 
