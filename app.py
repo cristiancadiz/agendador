@@ -22,7 +22,7 @@ import requests
 
 
 # =========================
-# Config / Entorno
+# Config / Entornoo
 # =========================
 TIMEZONE = os.getenv("TIMEZONE", "America/Santiago")
 CALENDAR_ID = os.getenv("GOOGLE_CALENDAR_ID")
