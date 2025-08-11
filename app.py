@@ -30,10 +30,13 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 OPENAI_MODEL = "gpt-3.5-turbo"
 
 COMPANY_NAME = os.getenv("COMPANY_NAME", "CrossFit Box")
+
+# Ahora el saludo NO pide el nombre. Solo se presenta.
 GREETING_TEXT = os.getenv(
     "GREETING_TEXT",
-    f"Hola 👋, somos {COMPANY_NAME}. Te inscribimos en clases. ¿Cuál es tu nombre?"
+    f"Hola 👋, somos {COMPANY_NAME}. Te inscribimos en clases."
 )
+
 FALLBACK_REPLY = os.getenv(
     "FALLBACK_REPLY",
     "Disculpa, no alcancé a entender 😅. ¿Me indicas tu nombre y la fecha/hora de la clase? (ej: 12/08 18:00)"
@@ -105,6 +108,8 @@ def _get_session(session_id: str):
             "awaiting_confirm": False,
             "candidate": None,
             "last_event_id": None,
+            # NUEVO: para pedir el nombre recién tras el primer mensaje
+            "asked_name": False,
         }
         SESSIONS[session_id] = s
     return s
@@ -126,7 +131,7 @@ def is_probable_name(text: str) -> bool:
 
 
 # =========================
-# HTML: Chat Web (solo nombre + fecha + hora)
+# HTML: Chat Web (solo saludo inicial; el nombre se pide tras el 1er mensaje del usuario)
 # =========================
 CHAT_HTML = """
 <!doctype html>
@@ -243,7 +248,7 @@ box.addEventListener('keydown', (e)=>{
   if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendNow(); }
 });
 
-// Mensaje inicial
+// Mensaje inicial: SOLO presentación (sin pedir nombre)
 addMsg({{ greeting|tojson }});
 </script>
 </body>
@@ -481,10 +486,12 @@ def enroll_in_class(nombre, start_dt, end_dt, capacidad=None, titulo=None, wa_id
 
 
 # =========================
-# Chatbot con GPT 3.5 — SOLO nombre + fecha/hora (con fallback robusto)
+# Chatbot con GPT 3.5 — pedir nombre DESPUÉS del primer mensaje
 # =========================
 SYSTEM_PROMPT = (
     "Eres el asistente de inscripciones de un box de CrossFit. "
+    "NO pidas el nombre antes de que el usuario envíe su primer mensaje. "
+    "Tras el primer mensaje, solicita el NOMBRE si aún no lo tienes. "
     "Objetivo: pedir SOLO NOMBRE y FECHA/HORA de la clase. "
     "Las clases duran 60 minutos y son de lunes a viernes, entre 09:00 y 18:00 (hora local). "
     "Cuando tengas nombre y una fecha/hora válida, propone confirmación y crea la inscripción. "
@@ -545,16 +552,32 @@ def process_chat(session_id: str, user_msg: str, wa_id: str | None = None):
     awaiting_confirm = session.get("awaiting_confirm", False)
 
     if not user_msg:
+        # Solo presentación al inicio
         return {"reply": GREETING_TEXT, "done": False}
 
-    # ---- FAST PATH 1: si parece un NOMBRE y aún no lo tenemos, lo tomamos y pedimos fecha/hora
-    if not slots.get("nombre") and is_probable_name(user_msg):
-        slots["nombre"] = user_msg.strip().title()
-        reply = f"Gracias, {slots['nombre']}. ¿Qué día y hora te acomoda? (ej: 12/08 18:00)"
+    # ======== LÓGICA DE “PEDIR NOMBRE TRAS 1er MENSAJE” ========
+    if not slots.get("nombre"):
+        # Si el mensaje YA parece un nombre, lo tomamos y pedimos fecha/hora
+        if is_probable_name(user_msg):
+            slots["nombre"] = user_msg.strip().title()
+            reply = f"Gracias, {slots['nombre']}. ¿Qué día y hora te acomoda? (ej: 12/08 18:00)"
+            history += [{"role": "user", "content": user_msg}, {"role": "assistant", "content": reply}]
+            session["asked_name"] = True
+            return {"reply": reply, "done": False}
+
+        # Si aún no hemos pedido el nombre, lo pedimos ahora (primer turno del usuario)
+        if not session.get("asked_name"):
+            session["asked_name"] = True
+            reply = "Gracias por escribir. ¿Podrías indicarme tu nombre completo?"
+            history += [{"role": "user", "content": user_msg}, {"role": "assistant", "content": reply}]
+            return {"reply": reply, "done": False}
+
+        # Ya pedimos el nombre antes y aún no llega uno válido
+        reply = "Para continuar, ¿me indicas por favor tu nombre completo?"
         history += [{"role": "user", "content": user_msg}, {"role": "assistant", "content": reply}]
         return {"reply": reply, "done": False}
 
-    # ---- FAST PATH 2: si ya tenemos NOMBRE y el mensaje parece FECHA/HORA, intentamos crear
+    # ---- FAST PATH: ya tenemos NOMBRE y el mensaje parece FECHA/HORA, intentamos crear
     if slots.get("nombre"):
         dt_try = parse_datetime_es({"datetime_text": user_msg})
         if dt_try:
