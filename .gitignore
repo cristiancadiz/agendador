@@ -1,0 +1,11 @@
+# Python
+__pycache__/
+*.pyc
+
+# Entornos
+.env
+venv/
+.venv/
+
+# Claves locales
+service_account.json
