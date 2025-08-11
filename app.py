@@ -986,7 +986,8 @@ def clases_stats_json():
         if not d1: return jsonify({"ok": False, "error": "end inválido (YYYY-MM-DD)"}), 400
         tmax = datetime(d1.year, d1.month, d1.day, 23, 59, 59, tzinfo=tz)
     else:
-        tmax = now
+        # INCLUIR futuro por defecto (90 días)
+        tmax = now + timedelta(days=90)
 
     rows = _class_stats(tmin, tmax, group_by=group_by)
     return jsonify({"ok": True, "desde": tmin.isoformat(), "hasta": tmax.isoformat(), "group_by": group_by, "total_personas": len(rows), "detalle": rows})
@@ -1013,7 +1014,8 @@ def clases_stats_csv():
         if not d1: return "end inválido", 400
         tmax = datetime(d1.year, d1.month, d1.day, 23, 59, 59, tzinfo=tz)
     else:
-        tmax = now
+        # INCLUIR futuro por defecto (90 días)
+        tmax = now + timedelta(days=90)
 
     rows = _class_stats(tmin, tmax, group_by=group_by)
     buf = StringIO()
@@ -1047,7 +1049,8 @@ def clases_stats_html():
         if not d1: return "end inválido", 400
         tmax = datetime(d1.year, d1.month, d1.day, 23, 59, 59, tzinfo=tz)
     else:
-        tmax = now
+        # INCLUIR futuro por defecto (90 días)
+        tmax = now + timedelta(days=90)
 
     rows = _class_stats(tmin, tmax, group_by=group_by)
 
@@ -1147,14 +1150,14 @@ def _parse_date_qs(param_value: str | None, default_dt: datetime):
 def clases_historial_json():
     tz = ZoneInfo(TIMEZONE)
     now = datetime.now(tz)
-    # rango por defecto: últimos 90 días
+    # rango por defecto: últimos 90 días hasta 90 días a futuro
     d0 = request.args.get("start")
     d1 = request.args.get("end")
     wa  = request.args.get("wa_id")
     nm  = request.args.get("name")
 
     tmin = _parse_date_qs(d0, now - timedelta(days=90))
-    tmax = _parse_date_qs(d1, now)
+    tmax = _parse_date_qs(d1, now + timedelta(days=90))
     if not tmin or not tmax:
         return jsonify({"ok": False, "error": "start/end inválidos (YYYY-MM-DD)"}), 400
 
@@ -1181,8 +1184,9 @@ def clases_historial_html():
     wa  = request.args.get("wa_id")
     nm  = request.args.get("name")
 
+    # rango por defecto: últimos 90 días hasta 90 días a futuro
     tmin = _parse_date_qs(d0, now - timedelta(days=90))
-    tmax = _parse_date_qs(d1, now)
+    tmax = _parse_date_qs(d1, now + timedelta(days=90))
     if not tmin or not tmax:
         return "start/end inválidos (YYYY-MM-DD)", 400
 
@@ -1223,7 +1227,7 @@ def clases_debug_html():
     tz = ZoneInfo(TIMEZONE)
     now = datetime.now(tz)
     tmin = now - timedelta(days=14)
-    tmax = now + timedelta(days=1)
+    tmax = now + timedelta(days=14)
 
     rows = []
     for ev in _iter_class_events(tmin, tmax):
@@ -1247,7 +1251,7 @@ def clases_debug_html():
     html = [
         "<!doctype html><meta charset='utf-8'><title>Debug clases</title>",
         "<style>body{font-family:system-ui;margin:24px} table{border-collapse:collapse} th,td{padding:6px 8px;border:1px solid #ddd;vertical-align:top} code{white-space:pre-wrap}</style>",
-        "<h1>Debug de clases (últimos 14 días)</h1>",
+        "<h1>Debug de clases (±14 días)</h1>",
         f"<p>Calendario: <code>{CALENDAR_ID}</code></p>",
         "<table><tr><th>Fecha</th><th>Título</th><th>Type</th><th>Cap.</th><th>Participantes</th><th>Evento</th></tr>"
     ]
