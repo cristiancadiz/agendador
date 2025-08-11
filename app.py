@@ -27,11 +27,11 @@ CALENDAR_ID = os.getenv("GOOGLE_CALENDAR_ID")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 OPENAI_MODEL = "gpt-3.5-turbo"  # fijo
 
-# Identidad de la empresa y saludo (conversacional)
+# Identidad y saludo
 COMPANY_NAME = os.getenv("COMPANY_NAME", "Departamento de Cobranza")
 GREETING_TEXT = os.getenv(
     "GREETING_TEXT",
-    f"Hola 👋, somos {COMPANY_NAME}. Te ayudamos a agendar tu cita. ¿Cómo te llamas?"
+    f"Hola 👋, somos {COMPANY_NAME}. Te ayudamos a agendar una llamada con un ejecutivo. ¿Cómo te llamas?"
 )
 
 # WhatsApp Cloud API (opcional)
@@ -61,12 +61,14 @@ oa_client = OpenAI(api_key=OPENAI_API_KEY)
 # Flask app
 app = Flask(__name__)
 
-# Estado por sesión:
+# =========================
+# Estado por sesión
+# =========================
 # { session_id: {
-#     "history":[...],                         # turns previos (texto natural)
-#     "slots":{"nombre","datetime_text","fecha","hora"},
-#     "awaiting_confirm": bool,                # si estamos esperando "sí/no"
-#     "candidate": {...}                       # propuesta de fecha/hora a confirmar
+#     "history":[...],
+#     "slots":{"nombre","datetime_text","fecha","hora","telefono","email"},
+#     "awaiting_confirm": bool,
+#     "candidate": {...}
 # } }
 SESSIONS = {}
 
@@ -78,7 +80,7 @@ CHAT_HTML = """
 <html lang="es">
 <head>
   <meta charset="utf-8">
-  <title>Agendar por chat</title>
+  <title>Agendar llamada</title>
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <style>
     :root{--bg:#0f172a;--panel:#0b1220;--card:#111827;--txt:#e5e7eb;--muted:#94a3b8;--me:#22c55e;--bot:#60a5fa;}
@@ -101,17 +103,18 @@ CHAT_HTML = """
     .foot button{background:var(--me);border:0;color:#052e16;padding:0 14px;border-radius:10px;font-weight:700;cursor:pointer}
     .hint{color:var(--muted);font-size:13px;margin-top:6px}
     a{color:#93c5fd}
-    .meetcard button{padding:6px 10px;border:0;border-radius:8px;cursor:pointer}
+    .evcard button{padding:6px 10px;border:0;border-radius:8px;cursor:pointer}
   </style>
 </head>
 <body>
   <div class="wrap">
     <div class="card">
       <div class="head">
-        <h1>Agendar por chat</h1>
-        <p>Duración fija: <b>30 minutos</b>. Zona: <b>{{ tz }}</b>. Solo necesito <b>tu nombre</b> y <b>fecha/hora</b>.</p>
+        <h1>Agendar llamada</h1>
+        <p>Un ejecutivo te llamará. Duración fija: <b>30 minutos</b>. Zona: <b>{{ tz }}</b>.</p>
         <div class="controls">
           <input id="tel" placeholder="Teléfono (opcional)">
+          <input id="mail" placeholder="Correo (opcional)">
           <input id="com" placeholder="Comentario (opcional)">
         </div>
         <p class="hint">Calendario: <code>{{ cal }}</code></p>
@@ -131,6 +134,7 @@ const box  = document.getElementById('box');
 const send = document.getElementById('send');
 const telI = document.getElementById('tel');
 const comI = document.getElementById('com');
+const mailI= document.getElementById('mail');
 
 const sid = localStorage.getItem('sid') || (() => {
   const v = 'web-' + Date.now() + '-' + Math.random().toString(36).slice(2,8);
@@ -148,25 +152,22 @@ function addMsg(text, who='bot'){
   chat.scrollTop = chat.scrollHeight;
 }
 
-function addMeetCard(link, htmlLink){
+function addEventCard(htmlLink, phone, email){
   const div = document.createElement('div');
   div.className = 'msg bot';
+  const safePhone = phone ? phone : '—';
+  const safeMail  = email ? email : '—';
   div.innerHTML = `
-    <div class="bubble meetcard">
+    <div class="bubble evcard">
       <div style="display:grid;gap:8px">
-        <div><b>Reunión creada</b></div>
-        ${link ? `<div>🔗 <a href="${link}" target="_blank" rel="noopener">${link}</a></div>` : `<div>No hay link de Meet</div>`}
+        <div><b>Llamada agendada</b></div>
+        <div>📞 Teléfono: <b>${safePhone}</b></div>
+        <div>✉️ Correo: <b>${safeMail}</b></div>
         ${htmlLink ? `<div>📅 <a href="${htmlLink}" target="_blank" rel="noopener">Ver en Google Calendar</a></div>` : ``}
-        ${link ? `<button id="copyMeet">Copiar enlace</button>` : ``}
       </div>
     </div>`;
   chat.appendChild(div);
   chat.scrollTop = chat.scrollHeight;
-  const btn = div.querySelector('#copyMeet');
-  if (btn) btn.onclick = async () => {
-    try { await navigator.clipboard.writeText(link); btn.textContent = '¡Copiado!'; }
-    catch(e){ btn.textContent = 'No se pudo copiar'; }
-  };
 }
 
 async function callBot(text){
@@ -174,6 +175,7 @@ async function callBot(text){
     session_id: sid,
     message: text,
     telefono: telI.value || '',
+    email: mailI.value || '',
     comentario: comI.value || ''
   };
   const resp = await fetch('/chatbot', {
@@ -188,7 +190,7 @@ async function callBot(text){
   const data = await resp.json();
   addMsg(data.reply || '(sin respuesta)', 'bot');
   if (data.done && data.evento) {
-    addMeetCard(data.evento.meet_link, data.evento.htmlLink);
+    addEventCard(data.evento.htmlLink, data.evento.telefono, data.evento.email);
   }
 }
 
@@ -205,7 +207,7 @@ box.addEventListener('keydown', (e)=>{
   if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendNow(); }
 });
 
-// Mensaje inicial (seguro con tojson)
+// Mensaje inicial
 addMsg({{ greeting|tojson }});
 </script>
 </body>
@@ -227,7 +229,7 @@ def parse_datetime_es(payload: dict):
     """
     Convierte texto o (fecha+hora) a datetime con tz.
     - DATE_ORDER=DMY (12/08 = 12 de agosto)
-    - Normaliza '14 horas/hrs' y 'a las 14' -> '14:00'
+    - Normaliza '13 horas/hrs', 'a las 13' y '13' (al final) -> '13:00'
     - Requiere hora cuando viene por texto natural
     - Prefiere futuro; RELATIVE_BASE ahora en TZ
     """
@@ -242,11 +244,14 @@ def parse_datetime_es(payload: dict):
 
     dt_text = (payload.get("datetime_text") or "").strip()
     if dt_text:
-        if not _has_time_token(dt_text):
-            return None
+        # Exige hora; normaliza "13 horas", "a las 13", o "13" al final
         txt = dt_text.lower()
+        # "13 horas" / "13 hrs" / "13 h"
         txt = re.sub(r"\b(a\s*las\s*)?(\d{1,2})\s*(h|hs|hrs|horas)\b", r"\2:00", txt)
+        # "a las 13" o "13" al final
         txt = re.sub(r"\b(a\s*las\s*)?(\d{1,2})\b(?=\s*$)", r"\2:00", txt)
+        if not _has_time_token(txt):
+            return None
         dt = dateparser.parse(txt, languages=["es"], settings=settings)
         if dt:
             return dt
@@ -267,67 +272,71 @@ def parse_datetime_es(payload: dict):
 
     return None
 
-def build_event_payload(nombre, start_dt, end_dt, telefono="", comentario=""):
-    description_items = []
+# =========================
+# Google Calendar helpers
+# =========================
+def build_event_payload(nombre, start_dt, end_dt, telefono="", email="", comentario=""):
+    description_lines = [
+        "Tipo: Llamada saliente",
+        f"Nombre: {nombre}",
+    ]
     if telefono:
-        description_items.append(f"Teléfono: {telefono}")
+        description_lines.append(f"Teléfono: {telefono}")
+    if email:
+        description_lines.append(f"Email: {email}")
     if comentario:
-        description_items.append(f"Comentario: {comentario}")
+        description_lines.append(f"Comentario: {comentario}")
 
     return {
-        "summary": f"Cita con {nombre}",
-        "description": "\n".join(description_items),
+        "summary": f"Llamada con {nombre}",
+        "description": "\n".join(description_lines),
         "start": {"dateTime": start_dt.isoformat(), "timeZone": TIMEZONE},
         "end": {"dateTime": end_dt.isoformat(), "timeZone": TIMEZONE},
-        "conferenceData": {"createRequest": {"requestId": str(uuid4())}},  # Meet
+        # Sin conferenceData: es una llamada telefónica
     }
 
-def format_confirmation_message(nombre: str, start_dt, meet_link: str | None) -> str:
+def format_confirmation_message(nombre: str, start_dt, telefono: str | None):
     fecha_legible = start_dt.strftime("%d-%m-%Y %H:%M")
+    tel_txt = f" al {telefono}" if telefono else ""
     base = (
         f"{COMPANY_NAME} — "
-        f"Listo {nombre}, tu cita quedó para el {fecha_legible} (hora {TIMEZONE}). "
-        f"Dura 30 minutos."
+        f"Listo {nombre}, agendé tu llamada para el {fecha_legible} (hora {TIMEZONE}). "
+        f"Un ejecutivo te contactará{tel_txt}. Dura 30 minutos. "
+        "Si necesitas cambiarla o cancelarla, avísame por aquí."
     )
-    if meet_link:
-        base += f" Link de videollamada: {meet_link}"
-    base += " Si necesitas cambiarla o cancelarla, avísame por aquí."
     return base
 
 def create_event_calendar(nombre, datetime_text=None, fecha=None, hora=None,
-                          telefono="", comentario="", allow_date_only=False):
-    """Crea evento (30 min) + Meet. Devuelve (evento, mensaje o error)."""
+                          telefono="", email="", comentario="", allow_date_only=False):
+    """Crea evento (30 min). Devuelve (evento, mensaje o error). Requiere teléfono y email."""
     start_dt = parse_datetime_es({
         "datetime_text": datetime_text, "fecha": fecha, "hora": hora,
         "_allow_date_only": allow_date_only
     })
     if not start_dt:
-        return None, "Para agendar necesito la fecha y la hora exactas (ejemplo: 12/08 14:00)."
+        return None, "Para agendar necesito la fecha y la hora exactas (ejemplo: 12/08 13:00)."
+
+    # Teléfono y email son obligatorios según la nueva política
+    telefono = (telefono or "").strip()
+    email = (email or "").strip()
+    if not telefono:
+        return None, "Me indicas tu número de teléfono para la llamada, por favor."
+    if not email:
+        return None, "¿Cuál es tu correo electrónico? (lo usamos solo para respaldo de contacto)."
 
     end_dt = start_dt + timedelta(minutes=30)
-    event_body = build_event_payload(nombre or "Cliente", start_dt, end_dt, telefono, comentario)
+    event_body = build_event_payload(nombre or "Cliente", start_dt, end_dt, telefono, email, comentario)
 
-    try:
-        created = gc_service.events().insert(
-            calendarId=CALENDAR_ID,
-            body=event_body,
-            sendUpdates="none",
-            conferenceDataVersion=1
-        ).execute()
-    except HttpError:
-        event_body.pop("conferenceData", None)
-        created = gc_service.events().insert(
-            calendarId=CALENDAR_ID,
-            body=event_body,
-            sendUpdates="none",
-        ).execute()
+    created = gc_service.events().insert(
+        calendarId=CALENDAR_ID,
+        body=event_body,
+        sendUpdates="none",
+    ).execute()
 
-    meet_link = (created.get("hangoutLink")
-                 or (created.get("conferenceData", {})
-                     .get("entryPoints", [{}])[0]
-                     .get("uri")))
-    msg = format_confirmation_message(nombre or "Cliente", start_dt, meet_link)
-    created["meet_link"] = meet_link
+    msg = format_confirmation_message(nombre or "Cliente", start_dt, telefono)
+    # Adjuntamos extras para que el front los muestre
+    created["telefono"] = telefono
+    created["email"] = email
     return created, msg
 
 # =========================
@@ -351,16 +360,17 @@ def list_routes():
     return jsonify(sorted([str(r) for r in app.url_map.iter_rules()]))
 
 FORM_HTML = """
-<!doctype html><html lang="es"><head><meta charset="utf-8"><title>Agendar</title></head>
+<!doctype html><html lang="es"><head><meta charset="utf-8"><title>Agendar llamada</title></head>
 <body style="font-family:system-ui;max-width:720px;margin:24px auto">
   <h1>Agendar (formulario)</h1>
   <form method="post" action="/nuevo">
     <label>Nombre</label><br><input name="nombre" placeholder="Juan Pérez" required><br><br>
     <label>Fecha (YYYY-MM-DD)</label><br><input name="fecha" type="date"><br><br>
     <label>Hora (HH:MM)</label><br><input name="hora" type="time"><br><br>
-    <label>O texto natural</label><br><input name="datetime_text" placeholder="12/08 a las 14:00"><br><br>
-    <label>Teléfono (opcional)</label><br><input name="telefono" placeholder="+569..."><br><br>
-    <label>Comentario (opcional)</label><br><input name="comentario" placeholder="Motivo de la reunión"><br><br>
+    <label>O texto natural</label><br><input name="datetime_text" placeholder="12/08 a las 13 horas"><br><br>
+    <label>Teléfono</label><br><input name="telefono" placeholder="+569..." required><br><br>
+    <label>Correo</label><br><input name="email" type="email" placeholder="tu@correo.com" required><br><br>
+    <label>Comentario (opcional)</label><br><input name="comentario" placeholder="Motivo de la llamada"><br><br>
     <button type="submit">Crear</button>
   </form>
   <p>Zona: {{ tz }} — Calendario: <code>{{ cal }}</code></p>
@@ -368,14 +378,15 @@ FORM_HTML = """
 """
 
 RESULT_HTML = """
-<!doctype html><html lang="es"><head><meta charset="utf-8"><title>Cita creada</title></head>
+<!doctype html><html lang="es"><head><meta charset="utf-8"><title>Llamada agendada</title></head>
 <body style="font-family:system-ui;max-width:720px;margin:24px auto">
-  <h1>✅ Reunión agendada</h1>
+  <h1>✅ Llamada agendada</h1>
   <p>{{ mensaje }}</p>
   <ul>
     <li><b>Inicio:</b> {{ start_dt }}</li>
     <li><b>Término:</b> {{ end_dt }}</li>
-    <li><b>Meet:</b> {% if meet_link %}<a href="{{ meet_link }}" target="_blank">{{ meet_link }}</a>{% else %}no disponible{% endif %}</li>
+    <li><b>Teléfono:</b> {{ telefono or "—" }}</li>
+    <li><b>Correo:</b> {{ email or "—" }}</li>
     <li><b>Evento Calendar:</b> <a href="{{ html_link }}" target="_blank">abrir</a></li>
   </ul>
   <pre style="white-space:pre-wrap;background:#0b1220;color:#e5e7eb;padding:12px;border-radius:6px">{{ pretty_event }}</pre>
@@ -396,8 +407,9 @@ def crear_cita_web():
         fecha=form.get("fecha"),
         hora=form.get("hora"),
         telefono=form.get("telefono"),
+        email=form.get("email"),
         comentario=form.get("comentario"),
-        allow_date_only=True,  # permite solo fecha (default 10:00) en formulario
+        allow_date_only=True,  # si solo ponen fecha, por defecto 10:00
     )
     if not created:
         return msg, 400
@@ -408,7 +420,8 @@ def crear_cita_web():
         start_dt=created.get("start", {}).get("dateTime"),
         end_dt=created.get("end", {}).get("dateTime"),
         html_link=created.get("htmlLink"),
-        meet_link=created.get("meet_link"),
+        telefono=created.get("telefono"),
+        email=created.get("email"),
         pretty_event=pretty
     )
 
@@ -428,6 +441,7 @@ def crear_cita_api():
         fecha=data.get("fecha"),
         hora=data.get("hora"),
         telefono=data.get("telefono"),
+        email=data.get("email"),
         comentario=data.get("comentario"),
     )
     if not created:
@@ -439,7 +453,8 @@ def crear_cita_api():
             "htmlLink": created.get("htmlLink"),
             "start": created.get("start"),
             "end": created.get("end"),
-            "meet_link": created.get("meet_link"),
+            "telefono": created.get("telefono"),
+            "email": created.get("email"),
         },
         "mensaje_para_cliente": msg
     }), 201
@@ -450,18 +465,19 @@ def crear_cita_api():
 SYSTEM_PROMPT = (
     "Eres el asistente de agenda de una empresa de cobranza judicial. "
     "Habla en tono cercano, claro y profesional (de tú). "
-    "Objetivo: conseguir NOMBRE y FECHA/HORA para una reunión de 30 minutos y crearla cuando el usuario confirme. "
+    "La cita es una LLAMADA telefónica de 30 minutos que realizará un ejecutivo. "
+    "Objetivo: conseguir NOMBRE, FECHA/HORA, TELÉFONO y CORREO; luego confirmar y crear la cita. "
     "Responde siempre con naturalidad (una o dos frases). No repitas lo que el usuario dice palabra por palabra. "
     "Además de tu respuesta, devuelve una estructura JSON con: "
     "  reply: tu respuesta natural para el usuario, "
-    "  slots: {nombre, datetime_text, fecha, hora} con lo que DETECTES EN EL ÚLTIMO MENSAJE, "
+    "  slots: {nombre, datetime_text, fecha, hora, telefono, email} con lo que DETECTES EN EL ÚLTIMO MENSAJE, "
     "  next_action: una de [smalltalk, ask_missing, confirm_time, create_event, none], "
     "  candidate: (opcional) {datetime_text | fecha+hora} cuando propongas/confirmes una hora. "
-    "Política: "
-    "- Si el usuario habla de otra cosa, contesta brevemente y redirige amable a agendar (smalltalk). "
-    "- Si falta nombre u hora/fecha, pide SOLO lo que falta (ask_missing). "
-    "- Si el usuario dio nombre y hora/fecha, propone y pide confirmación (confirm_time). "
-    "- Solo marca create_event cuando el usuario ha confirmado de forma clara. "
+    "Reglas: "
+    "- Si el usuario habla de otra cosa, contesta breve y redirige amable a agendar (smalltalk). "
+    "- Si falta alguno de [nombre, fecha/hora, teléfono, correo], pide SOLO lo que falte (ask_missing). "
+    "- Si ya hay [nombre, fecha/hora, teléfono y correo], propone y pide confirmación (confirm_time). "
+    "- Marca create_event SOLO cuando el usuario haya confirmado de forma clara. "
     "- No inventes datos."
 )
 
@@ -470,7 +486,7 @@ def _get_session(session_id: str):
     if not s:
         s = {
             "history": [],
-            "slots": {"nombre":"", "datetime_text":"", "fecha":"", "hora":""},
+            "slots": {"nombre":"", "datetime_text":"", "fecha":"", "hora":"", "telefono":"", "email":""},
             "awaiting_confirm": False,
             "candidate": None
         }
@@ -493,7 +509,7 @@ def llm_orchestrate(history, slots, awaiting_confirm, candidate, user_message):
     messages.append({"role": "system", "content":
         "Devuelve SOLO un JSON con este esquema: "
         "{ \"reply\":\"...\", "
-        "  \"slots\": {\"nombre\":\"\", \"datetime_text\":\"\", \"fecha\":\"\", \"hora\":\"\"}, "
+        "  \"slots\": {\"nombre\":\"\", \"datetime_text\":\"\", \"fecha\":\"\", \"hora\":\"\", \"telefono\":\"\", \"email\":\"\"}, "
         "  \"next_action\":\"smalltalk|ask_missing|confirm_time|create_event|none\", "
         "  \"candidate\": {\"datetime_text\":\"\"} ó {\"fecha\":\"\", \"hora\":\"\"} "
         "} "
@@ -507,12 +523,12 @@ def llm_orchestrate(history, slots, awaiting_confirm, candidate, user_message):
     try:
         data = json.loads(raw)
     except Exception:
-        data = {"reply": "Perdona, no te entendí bien. ¿Me dices tu nombre y una fecha/hora? (ej: 12/08 14:00)",
-                "slots": {"nombre":"", "datetime_text":"", "fecha":"", "hora":""},
+        data = {"reply": "¿Me indicas tu nombre, tu teléfono y una fecha/hora? (ej: 12/08 13:00). También tu correo, por favor.",
+                "slots": {"nombre":"", "datetime_text":"", "fecha":"", "hora":"", "telefono":"", "email":""},
                 "next_action": "ask_missing"}
     # Normaliza
     data.setdefault("reply", "")
-    data.setdefault("slots", {"nombre":"", "datetime_text":"", "fecha":"", "hora":""})
+    data.setdefault("slots", {"nombre":"", "datetime_text":"", "fecha":"", "hora":"", "telefono":"", "email":""})
     data.setdefault("next_action", "none")
     if "candidate" in data and isinstance(data["candidate"], dict):
         for k, v in list(data["candidate"].items()):
@@ -520,7 +536,7 @@ def llm_orchestrate(history, slots, awaiting_confirm, candidate, user_message):
                 data["candidate"][k] = v.strip()
     return data
 
-def process_chat(session_id: str, user_msg: str, telefono: str = "", comentario: str = ""):
+def process_chat(session_id: str, user_msg: str, telefono: str = "", email: str = "", comentario: str = ""):
     session = _get_session(session_id)
     history = session["history"]
     slots = session["slots"]
@@ -535,7 +551,7 @@ def process_chat(session_id: str, user_msg: str, telefono: str = "", comentario:
 
     # 2) Fusiona slots con SOLO lo detectado ahora
     new_slots = plan.get("slots", {})
-    for k in ["nombre", "datetime_text", "fecha", "hora"]:
+    for k in ["nombre", "datetime_text", "fecha", "hora", "telefono", "email"]:
         if new_slots.get(k):
             slots[k] = new_slots[k]
 
@@ -547,37 +563,52 @@ def process_chat(session_id: str, user_msg: str, telefono: str = "", comentario:
     if action == "confirm_time":
         session["awaiting_confirm"] = True
         cand_payload = {
-            "nombre": slots.get("nombre") or "Cliente",
+            "nombre": (slots.get("nombre") or "Cliente").strip(),
             "datetime_text": cand.get("datetime_text") or slots.get("datetime_text"),
             "fecha": cand.get("fecha") or slots.get("fecha"),
             "hora":  cand.get("hora")  or slots.get("hora"),
-            "telefono": telefono, "comentario": comentario
+            # Fallback: si no tenemos teléfono/email en slots, usa los pasados por parámetro (web inputs o WA phone)
+            "telefono": (slots.get("telefono") or telefono or "").strip(),
+            "email": (slots.get("email") or email or "").strip(),
+            "comentario": comentario
         }
         session["candidate"] = cand_payload
         history += [{"role":"user","content":user_msg},{"role":"assistant","content":reply}]
         return {"reply": reply, "done": False}
 
     if action == "create_event":
-        nombre = (cand.get("nombre") or slots.get("nombre") or "Cliente").strip()
+        cand_or_slots = {
+            "nombre": (cand.get("nombre") or slots.get("nombre") or "Cliente").strip(),
+            "datetime_text": cand.get("datetime_text") or slots.get("datetime_text"),
+            "fecha": cand.get("fecha") or slots.get("fecha"),
+            "hora": cand.get("hora") or slots.get("hora"),
+            "telefono": (cand.get("telefono") or slots.get("telefono") or telefono or "").strip(),
+            "email": (cand.get("email") or slots.get("email") or email or "").strip(),
+        }
+
         created, msg = create_event_calendar(
-            nombre=nombre,
-            datetime_text=cand.get("datetime_text") or slots.get("datetime_text"),
-            fecha=cand.get("fecha") or slots.get("fecha"),
-            hora=cand.get("hora") or slots.get("hora"),
-            telefono=telefono,
+            nombre=cand_or_slots["nombre"],
+            datetime_text=cand_or_slots["datetime_text"],
+            fecha=cand_or_slots["fecha"],
+            hora=cand_or_slots["hora"],
+            telefono=cand_or_slots["telefono"],
+            email=cand_or_slots["email"],
             comentario=comentario,
         )
+
         session["awaiting_confirm"] = False
         session["candidate"] = None
         if not created:
-            reply = "No me quedó clara la fecha/hora. ¿Me la confirmas en DD/MM o YYYY-MM-DD y HH:MM (24 h)?"
-            history += [{"role":"user","content":user_msg},{"role":"assistant","content":reply}]
-            return {"reply": reply, "done": False}
-        session["slots"] = {"nombre":"", "datetime_text":"", "fecha":"", "hora":""}
+            # Si faltó teléfono o email, el mensaje de error ya lo indica
+            history += [{"role":"user","content":user_msg},{"role":"assistant","content":msg}]
+            return {"reply": msg, "done": False}
+
+        # limpiar slots para próxima cita
+        session["slots"] = {"nombre":"", "datetime_text":"", "fecha":"", "hora":"", "telefono":"", "email":""}
         history += [{"role":"user","content":user_msg},{"role":"assistant","content":msg}]
         return {"reply": msg, "done": True, "evento": created}
 
-    # smalltalk / ask_missing / none → responde conversacional y seguimos
+    # smalltalk / ask_missing / none → responde natural y seguimos
     history += [{"role":"user","content":user_msg},{"role":"assistant","content":reply}]
     return {"reply": reply, "done": False}
 
@@ -588,6 +619,7 @@ def chatbot():
         session_id=(data.get("session_id") or "default"),
         user_msg=(data.get("message") or "").strip(),
         telefono=(data.get("telefono") or "").strip(),
+        email=(data.get("email") or "").strip(),
         comentario=(data.get("comentario") or "").strip(),
     )
     return jsonify(res)
@@ -626,12 +658,13 @@ def wa_incoming():
             return "ok", 200
 
         msg = messages[0]
-        from_id = msg.get("from")
+        from_id = msg.get("from")  # E.164 SIN '+'
         text = ""
         if msg.get("type") == "text":
             text = (msg.get("text", {}) or {}).get("body", "")
 
-        res = process_chat(session_id=from_id, user_msg=text)
+        # Fallback: en WhatsApp usamos el mismo número del remitente como teléfono si el usuario no lo entrega
+        res = process_chat(session_id=from_id, user_msg=text, telefono=from_id)
 
         url = f"https://graph.facebook.com/v20.0/{WA_PHONE_ID}/messages"
         headers = {"Authorization": f"Bearer {WA_TOKEN}", "Content-Type": "application/json"}
