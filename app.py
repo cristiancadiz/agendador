@@ -3,7 +3,7 @@ import re
 import json
 import time
 import base64
-from datetime import timedelta, datetime
+from datetime import timedelta, datetime, date
 from zoneinfo import ZoneInfo
 from urllib.parse import quote, urlparse, parse_qs
 
@@ -21,6 +21,12 @@ from openai import OpenAI
 # HTTP para WhatsApp Cloud API
 import requests
 
+# ====== (opcional) feriados con 'holidays' si está instalado ======
+try:
+    import holidays as pyholidays  # pip install holidays
+except Exception:
+    pyholidays = None
+
 # =========================
 # Config / Entorno
 # =========================
@@ -35,9 +41,13 @@ GREETING_TEXT = os.getenv(
     f"Hola 👋, somos {COMPANY_NAME}. Te ayudamos a agendar una llamada con un ejecutivo. ¿Cómo te llamas?"
 )
 
-# Horario de atención
+# Horario / días hábiles
 BUSINESS_START_HOUR = int(os.getenv("BUSINESS_START_HOUR", "9"))
 BUSINESS_END_HOUR   = int(os.getenv("BUSINESS_END_HOUR", "19"))
+BUSINESS_BLOCK_WEEKENDS = os.getenv("BUSINESS_BLOCK_WEEKENDS", "1") == "1"
+CLOSED_DATES = set(d.strip() for d in os.getenv("CLOSED_DATES", "").split(",") if d.strip())
+HOLIDAYS_COUNTRY = os.getenv("HOLIDAYS_COUNTRY", "").strip()  # ej "CL"
+HOLIDAYS_PROV    = os.getenv("HOLIDAYS_PROV", "").strip()
 
 # WhatsApp Cloud API
 WA_TOKEN = os.getenv("WA_TOKEN")
@@ -50,7 +60,6 @@ WA_DEDUP_TTL = int(os.getenv("WA_DEDUP_TTL_SEC", "300"))  # 5 min
 _PROCESADOS = {}  # {message_id: expire_ts}
 
 def wa_is_dup(message_id: str) -> bool:
-    """True si ya procesamos este message_id dentro del TTL."""
     now = time.time()
     for k, exp in list(_PROCESADOS.items()):
         if exp < now:
@@ -85,15 +94,7 @@ app = Flask(__name__)
 # =========================
 # Estado por sesión
 # =========================
-# { session_id: {
-#     "history":[...],
-#     "slots":{nombre,datetime_text,fecha,hora,telefono,email},
-#     "awaiting_confirm": bool,
-#     "candidate": {...},
-#     "last_event_id": str|None,
-#     "cancel_pending": {"event_id","calendar_id","when"}|None
-# } }
-SESSIONS = {}
+SESSIONS = {}  # { session_id: {...} }
 
 def _get_session(session_id: str):
     s = SESSIONS.get(session_id)
@@ -309,33 +310,48 @@ def parse_datetime_es(payload: dict):
     return None
 
 # =========================
-# Horario de atención y disponibilidad
+# Business days / horario / disponibilidad
 # =========================
+def is_closed_date_local(d: date) -> bool:
+    if d.strftime("%Y-%m-%d") in CLOSED_DATES:
+        return True
+    if pyholidays and HOLIDAYS_COUNTRY:
+        try:
+            cal = pyholidays.country_holidays(HOLIDAYS_COUNTRY, subdiv=HOLIDAYS_PROV, years=d.year)
+            if d in cal:
+                return True
+        except Exception:
+            pass
+    return False
+
 def within_business_hours(start_dt, end_dt):
-    """
-    True si la cita cae completamente dentro del horario de atención.
-    Valida en la zona local (TIMEZONE) y mismo día.
-    """
+    """Valida mismo día, horario 09–19 (config), weekends/feriados si aplica."""
     local_start = start_dt.astimezone(ZoneInfo(TIMEZONE))
     local_end   = end_dt.astimezone(ZoneInfo(TIMEZONE))
 
+    # mismo día
     if local_start.date() != local_end.date():
-        return False, f"La cita debe quedar dentro del mismo día (horario de atención {BUSINESS_START_HOUR:02d}:00–{BUSINESS_END_HOUR:02d}:00)."
+        return False, f"La cita debe quedar dentro del mismo día (horario {BUSINESS_START_HOUR:02d}:00–{BUSINESS_END_HOUR:02d}:00)."
 
+    # fines de semana
+    if BUSINESS_BLOCK_WEEKENDS and local_start.weekday() >= 5:
+        return False, "No agendamos fines de semana. Nuestro horario es de lunes a viernes, 09:00–19:00."
+
+    # feriados
+    if is_closed_date_local(local_start.date()):
+        return False, f"El {local_start.date().strftime('%d-%m-%Y')} es feriado y no estamos atendiendo."
+
+    # horario
     start_minutes = local_start.hour * 60 + local_start.minute
     end_minutes   = local_end.hour * 60 + local_end.minute
     open_minutes  = BUSINESS_START_HOUR * 60
     close_minutes = BUSINESS_END_HOUR * 60
-
     if start_minutes < open_minutes or end_minutes > close_minutes:
         return False, f"Fuera de horario: atendemos de {BUSINESS_START_HOUR:02d}:00 a {BUSINESS_END_HOUR:02d}:00."
     return True, ""
 
 def slot_is_free(start_dt, end_dt, calendar_id=None):
-    """
-    Usa FreeBusy de Google Calendar para verificar que no haya solapes.
-    Devuelve (True, "") si está libre; (False, "motivo") si está ocupado.
-    """
+    """FreeBusy para evitar solapes."""
     cal_id = calendar_id or CALENDAR_ID
     try:
         body = {
@@ -356,7 +372,6 @@ def slot_is_free(start_dt, end_dt, calendar_id=None):
 # Links “Añadir a GCal” y .ics
 # =========================
 def _to_utc_fmt(dt):
-    """YYYYMMDDTHHMMSSZ en UTC."""
     dt_utc = dt.astimezone(ZoneInfo("UTC"))
     return dt_utc.strftime("%Y%m%dT%H%M%SZ")
 
@@ -432,15 +447,12 @@ def create_event_calendar(nombre, datetime_text=None, fecha=None, hora=None,
     if not email:
         return None, "¿Cuál es tu correo electrónico? (lo usamos solo para respaldo de contacto)."
 
-    # 30 minutos
     end_dt = start_dt + timedelta(minutes=30)
 
-    # Horario de atención
     ok_hours, msg_hours = within_business_hours(start_dt, end_dt)
     if not ok_hours:
         return None, msg_hours
 
-    # Disponibilidad (sin solapes)
     ok_free, msg_free = slot_is_free(start_dt, end_dt, CALENDAR_ID)
     if not ok_free:
         return None, msg_free
@@ -483,7 +495,6 @@ def update_event_calendar(event_id: str,
             return None, "No entendí la nueva fecha/hora. Ej: 12/08 13:00."
         end_dt = start_dt + timedelta(minutes=30)
 
-        # Evita rechazo cuando no cambia el horario
         curr_start = ev.get("start", {}).get("dateTime")
         curr_end   = ev.get("end", {}).get("dateTime")
         same_as_now = False
@@ -496,12 +507,10 @@ def update_event_calendar(event_id: str,
         except Exception:
             same_as_now = False
 
-        # Horario de atención
         ok_hours, msg_hours = within_business_hours(start_dt, end_dt)
         if not ok_hours:
             return None, msg_hours
 
-        # Disponibilidad si cambia el slot
         if not same_as_now:
             ok_free, msg_free = slot_is_free(start_dt, end_dt, CALENDAR_ID)
             if not ok_free:
@@ -543,7 +552,6 @@ def delete_event_calendar(event_id: str, calendar_id: str | None = None):
         return False, f"No pude eliminar la cita ({event_id}). {e.reason}"
 
 def extract_event_and_cal_from_eid(eid_or_link: str):
-    """Acepta el 'eid' o el 'htmlLink' y devuelve (event_id, calendar_id|None)."""
     if not eid_or_link:
         return None, None
     if eid_or_link.startswith("http"):
@@ -581,7 +589,6 @@ def human_dt(dt_iso: str):
         return dt_iso
 
 def find_event_id_by_datetime(dt_target, cal_id=None, tolerance_min=15):
-    """Busca un evento que empiece cerca de dt_target ±tolerance_min y tenga summary 'Llamada con ...'."""
     cal_id = cal_id or CALENDAR_ID
     tmin = (dt_target - timedelta(minutes=tolerance_min)).isoformat()
     tmax = (dt_target + timedelta(minutes=tolerance_min)).isoformat()
@@ -613,6 +620,10 @@ def diag():
         "calendar_id": CALENDAR_ID,
         "timezone": TIMEZONE,
         "service_account_email": info.get("client_email"),
+        "business_hours": [BUSINESS_START_HOUR, BUSINESS_END_HOUR],
+        "block_weekends": BUSINESS_BLOCK_WEEKENDS,
+        "closed_dates": sorted(list(CLOSED_DATES)),
+        "holidays_country": HOLIDAYS_COUNTRY if pyholidays else "(modulo 'holidays' no instalado)"
     })
 
 @app.get("/_routes")
@@ -912,6 +923,11 @@ def llm_orchestrate(history, slots, awaiting_confirm, candidate, user_message):
                 data["candidate"][k] = v.strip()
     return data
 
+# ========= Conversación (incluye cancelación) =========
+CANCEL_RE = re.compile(r"\b(cancelar|anular|eliminar)\b.*\b(cita|llamada)\b", re.I)
+YES_RE = re.compile(r"^\s*(sí|si|ok|de acuerdo|confirmo|confirmar|adelante|proceder)\b", re.I)
+NO_RE  = re.compile(r"^\s*(no|cancelar no|mejor no|anular no)\b", re.I)
+
 def process_chat(session_id: str, user_msg: str, telefono: str = "", email: str = "", comentario: str = ""):
     session = _get_session(session_id)
     history = session["history"]
@@ -921,7 +937,7 @@ def process_chat(session_id: str, user_msg: str, telefono: str = "", email: str 
     if not user_msg:
         return {"reply": GREETING_TEXT, "done": False}
 
-    # --- CANCELACIÓN: confirmación y ejecución (antes del LLM) ---
+    # --- Cancelación: confirmación/ejecución ---
     cp = session.get("cancel_pending")
     if cp:
         if YES_RE.search(user_msg):
@@ -930,8 +946,7 @@ def process_chat(session_id: str, user_msg: str, telefono: str = "", email: str 
             if ok:
                 if session.get("last_event_id") == cp["event_id"]:
                     session["last_event_id"] = None
-                reply = f"Listo, cancelé tu cita del {cp['when']}."
-                return {"reply": reply, "done": False}
+                return {"reply": f"Listo, cancelé tu cita del {cp['when']}.", "done": False}
             else:
                 return {"reply": f"No pude cancelar la cita ({cp['event_id']}). {msg_del}", "done": False}
         elif NO_RE.search(user_msg):
@@ -940,7 +955,6 @@ def process_chat(session_id: str, user_msg: str, telefono: str = "", email: str 
         return {"reply": f"¿Confirmas que deseas cancelar la cita del {cp['when']}? Responde “sí cancelar” o “no”.", "done": False}
 
     if CANCEL_RE.search(user_msg):
-        # 1) última cita de la sesión
         last_id = session.get("last_event_id")
         if last_id:
             try:
@@ -950,16 +964,12 @@ def process_chat(session_id: str, user_msg: str, telefono: str = "", email: str 
                 return {"reply": f"¿Confirmas que quieres cancelar la cita del {when}? Responde “sí cancelar” o “no”.", "done": False}
             except HttpError:
                 pass
-
-        # 2) link o eid
         m = re.search(r"(https?://www\.google\.com/calendar/event\?eid=[^\s]+)", user_msg)
         eid = None
-        if m:
-            eid = m.group(1)
+        if m: eid = m.group(1)
         else:
             m2 = re.search(r"\beid=([A-Za-z0-9_\-]+)", user_msg)
-            if m2:
-                eid = m2.group(1)
+            if m2: eid = m2.group(1)
         if eid:
             ev_id, cal_id = extract_event_and_cal_from_eid(eid)
             if ev_id:
@@ -970,8 +980,6 @@ def process_chat(session_id: str, user_msg: str, telefono: str = "", email: str 
                     return {"reply": f"¿Confirmas cancelar la cita del {when}? Responde “sí cancelar” o “no”.", "done": False}
                 except HttpError:
                     return {"reply": "No pude localizar esa cita con el enlace. ¿Puedes darme la fecha y hora exactas (ej: 12/08 13:00)?", "done": False}
-
-        # 3) fecha/hora “cancela la del 12/08 13:00”
         dt = parse_datetime_es({"datetime_text": user_msg})
         if dt:
             ev_id, ev = find_event_id_by_datetime(dt, CALENDAR_ID, tolerance_min=15)
@@ -981,15 +989,12 @@ def process_chat(session_id: str, user_msg: str, telefono: str = "", email: str 
                 return {"reply": f"Voy a cancelar la cita del {when}. ¿Lo confirmas? (responde “sí cancelar” o “no”)", "done": False}
             else:
                 return {"reply": "No encontré una cita en ese horario. ¿Puedes confirmar fecha y hora exactas (ej: 12/08 13:00) o pegar el link del evento?", "done": False}
-
-        # 4) pedir datos
         return {"reply": "Para cancelar, indícame la fecha y hora de la cita (ej: 12/08 13:00) o pégame el link del evento.", "done": False}
 
-    # --- Orquestación normal con LLM ---
+    # --- Orquestación con LLM ---
     candidate = session.get("candidate")
     plan = llm_orchestrate(history, slots, awaiting_confirm, candidate, user_msg)
 
-    # fusionar slots con lo detectado ahora
     new_slots = plan.get("slots", {})
     for k in ["nombre", "datetime_text", "fecha", "hora", "telefono", "email"]:
         if new_slots.get(k):
@@ -1038,7 +1043,6 @@ def process_chat(session_id: str, user_msg: str, telefono: str = "", email: str 
             history += [{"role":"user","content":user_msg},{"role":"assistant","content":msg}]
             return {"reply": msg, "done": False}
 
-        # auto-borrar último evento de la sesión (reprogramación)
         last_event_id = session.get("last_event_id")
         if last_event_id:
             try:
@@ -1047,7 +1051,6 @@ def process_chat(session_id: str, user_msg: str, telefono: str = "", email: str 
                 pass
         session["last_event_id"] = created.get("id")
 
-        # limpiar slots para próxima cita
         session["slots"] = {"nombre":"", "datetime_text":"", "fecha":"", "hora":"", "telefono":"", "email":""}
         history += [{"role":"user","content":user_msg},{"role":"assistant","content":msg}]
         return {"reply": msg, "done": True, "evento": created}
@@ -1119,13 +1122,11 @@ def wa_incoming():
             url = f"https://graph.facebook.com/v20.0/{phone_id}/messages"
             headers = {"Authorization": f"Bearer {WA_TOKEN}", "Content-Type": "application/json"}
 
-            # 1) Mensaje de texto
             body = {"messaging_product": "whatsapp", "to": from_id, "text": {"body": res.get("reply") or "..."}} 
             r = requests.post(url, headers=headers, json=body, timeout=30)
             if DEBUG_WA:
                 print("WA OUT <<<", r.status_code, r.text)
 
-            # 2) Si se creó la cita, enviar .ics y link “Añadir a Google Calendar”
             if res.get("done") and res.get("evento"):
                 ev = res["evento"]
                 if ev.get("icsUrl"):
