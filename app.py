@@ -354,3 +354,129 @@ if __name__ == "__main__":
     args = parser.parse_args()
     if args.runserver:
         app.run(host="0.0.0.0", port=int(os.getenv("PORT", 8000)))
+
+# ====== Página de chat web ======
+from flask import render_template_string
+
+CHAT_HTML = """
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8">
+  <title>Chat de Agenda</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <style>
+    :root{--bg:#0f172a;--panel:#0b1220;--card:#111827;--txt:#e5e7eb;--muted:#94a3b8;--me:#22c55e;--bot:#60a5fa;}
+    *{box-sizing:border-box} body{margin:0;background:var(--bg);color:var(--txt);font:16px/1.5 system-ui,Segoe UI,Roboto}
+    .wrap{max-width:860px;margin:24px auto;padding:0 12px}
+    .card{background:var(--card);border-radius:16px;box-shadow:0 10px 30px rgba(0,0,0,.35)}
+    .head{padding:16px 18px;border-bottom:1px solid #1f2937}
+    .head h1{margin:0;font-size:18px}
+    .head p{margin:6px 0 0;color:var(--muted);font-size:14px}
+    .controls{display:flex;gap:8px;flex-wrap:wrap;margin-top:12px}
+    .controls input{background:var(--panel);border:1px solid #1f2937;border-radius:10px;padding:8px 10px;color:var(--txt)}
+    .chat{height:58vh;overflow:auto;padding:16px}
+    .msg{display:flex;margin:10px 0}
+    .msg.you{justify-content:flex-end}
+    .bubble{max-width:70%;padding:10px 12px;border-radius:14px;line-height:1.35}
+    .you .bubble{background:rgba(34,197,94,.15);border:1px solid rgba(34,197,94,.4)}
+    .bot .bubble{background:rgba(96,165,250,.15);border:1px solid rgba(96,165,250,.4)}
+    .foot{display:flex;gap:10px;padding:14px;border-top:1px solid #1f2937}
+    .foot textarea{flex:1;min-height:46px;max-height:200px;resize:vertical;background:var(--panel);border:1px solid #1f2937;border-radius:10px;padding:10px;color:var(--txt)}
+    .foot button{background:var(--me);border:0;color:#052e16;padding:0 14px;border-radius:10px;font-weight:700;cursor:pointer}
+    .hint{color:var(--muted);font-size:13px;margin-top:6px}
+    a{color:#93c5fd}
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="card">
+      <div class="head">
+        <h1>Agendar por chat</h1>
+        <p>Duración fija: <b>30 minutos</b>. Zona: <b>{{ tz }}</b>. El bot solo te pedirá <b>nombre</b> y <b>fecha/hora</b>.</p>
+        <div class="controls">
+          <input id="tel" placeholder="Teléfono (opcional)">
+          <input id="com" placeholder="Comentario (opcional)">
+        </div>
+        <p class="hint">Calendario: <code>{{ cal }}</code></p>
+      </div>
+      <div id="chat" class="chat"></div>
+      <div class="foot">
+        <textarea id="box" placeholder="Escribe aquí… (Enter para enviar, Shift+Enter para salto)"></textarea>
+        <button id="send">Enviar</button>
+      </div>
+    </div>
+    <p class="hint" style="margin-left:6px">Si prefieres formulario: <a href="/nuevo">agendar con formulario</a></p>
+  </div>
+
+<script>
+const chat = document.getElementById('chat');
+const box  = document.getElementById('box');
+const send = document.getElementById('send');
+const telI = document.getElementById('tel');
+const comI = document.getElementById('com');
+
+const sid = localStorage.getItem('sid') || (() => {
+  const v = 'web-' + Date.now() + '-' + Math.random().toString(36).slice(2,8);
+  localStorage.setItem('sid', v); return v;
+})();
+
+function addMsg(text, who='bot'){
+  const div = document.createElement('div');
+  div.className = 'msg ' + (who==='you'?'you':'bot');
+  const b = document.createElement('div');
+  b.className = 'bubble';
+  b.textContent = text;
+  div.appendChild(b);
+  chat.appendChild(div);
+  chat.scrollTop = chat.scrollHeight;
+}
+
+async function callBot(text){
+  const payload = {
+    session_id: sid,
+    message: text,
+    telefono: telI.value || '',
+    comentario: comI.value || ''
+  };
+  const resp = await fetch('/chatbot', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify(payload)
+  });
+  if (!resp.ok) {
+    addMsg('Ups, no pude procesar ahora (' + resp.status + '). Intenta de nuevo.', 'bot');
+    return;
+  }
+  const data = await resp.json();
+  addMsg(data.reply || '(sin respuesta)', 'bot');
+  if (data.done && data.evento && data.evento.meet_link) {
+    addMsg('Link de la reunión: ' + data.evento.meet_link, 'bot');
+  }
+}
+
+function sendNow(){
+  const text = box.value.trim();
+  if (!text) return;
+  addMsg(text, 'you');
+  box.value = '';
+  callBot(text);
+}
+
+send.onclick = sendNow;
+box.addEventListener('keydown', (e)=>{
+  if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendNow(); }
+});
+
+// Mensaje inicial
+addMsg('¡Hola! ¿Para qué fecha y hora quieres la cita? (p.ej., “mañana a las 13:00”). Dime también tu nombre.');
+</script>
+</body>
+</html>
+"""
+
+@app.get("/chat")
+def chat_ui():
+    # Muestra la caja de chat
+    return render_template_string(CHAT_HTML, tz=TIMEZONE, cal=CALENDAR_ID)
+
