@@ -3,7 +3,6 @@ import re
 import json
 import time
 import base64
-from uuid import uuid4
 from datetime import timedelta, datetime
 from zoneinfo import ZoneInfo
 from urllib.parse import quote, urlparse, parse_qs
@@ -28,7 +27,7 @@ import requests
 TIMEZONE = os.getenv("TIMEZONE", "America/Santiago")
 CALENDAR_ID = os.getenv("GOOGLE_CALENDAR_ID")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-OPENAI_MODEL = "gpt-3.5-turbo"  # fijo
+OPENAI_MODEL = "gpt-3.5-turbo"
 
 COMPANY_NAME = os.getenv("COMPANY_NAME", "Departamento de Cobranza")
 GREETING_TEXT = os.getenv(
@@ -49,7 +48,6 @@ _PROCESADOS = {}  # {message_id: expire_ts}
 def wa_is_dup(message_id: str) -> bool:
     """True si ya procesamos este message_id dentro del TTL."""
     now = time.time()
-    # limpia expirados
     for k, exp in list(_PROCESADOS.items()):
         if exp < now:
             _PROCESADOS.pop(k, None)
@@ -83,8 +81,14 @@ app = Flask(__name__)
 # =========================
 # Estado por sesión
 # =========================
-# { session_id: { "history":[...], "slots":{nombre,datetime_text,fecha,hora,telefono,email},
-#                 "awaiting_confirm": bool, "candidate": {...}, "last_event_id": str } }
+# { session_id: {
+#     "history":[...],
+#     "slots":{nombre,datetime_text,fecha,hora,telefono,email},
+#     "awaiting_confirm": bool,
+#     "candidate": {...},
+#     "last_event_id": str|None,
+#     "cancel_pending": {"event_id","calendar_id","when"}|None
+# } }
 SESSIONS = {}
 
 def _get_session(session_id: str):
@@ -96,6 +100,7 @@ def _get_session(session_id: str):
             "awaiting_confirm": False,
             "candidate": None,
             "last_event_id": None,
+            "cancel_pending": None,
         }
         SESSIONS[session_id] = s
     return s
@@ -275,9 +280,7 @@ def parse_datetime_es(payload: dict):
     dt_text = (payload.get("datetime_text") or "").strip()
     if dt_text:
         txt = dt_text.lower()
-        # "13 horas" / "13 hrs" / "13 h"
         txt = re.sub(r"\b(a\s*las\s*)?(\d{1,2})\s*(h|hs|hrs|horas)\b", r"\2:00", txt)
-        # "a las 13" o "13" al final
         txt = re.sub(r"\b(a\s*las\s*)?(\d{1,2})\b(?=\s*$)", r"\2:00", txt)
         if not _has_time_token(txt):
             return None
@@ -310,7 +313,6 @@ def _to_utc_fmt(dt):
     return dt_utc.strftime("%Y%m%dT%H%M%SZ")
 
 def make_gcal_template_link(summary: str, start_dt, end_dt, description: str = "", location: str = ""):
-    # https://calendar.google.com/calendar/render?action=TEMPLATE...
     qs = {
         "action": "TEMPLATE",
         "text": summary or "Cita",
@@ -322,27 +324,16 @@ def make_gcal_template_link(summary: str, start_dt, end_dt, description: str = "
     return base + "&".join([f"{k}={quote(v)}" for k, v in qs.items() if v])
 
 def build_ics_from_event(ev: dict):
-    """
-    Genera contenido .ics a partir del evento de Google.
-    Usa UTC para máxima compatibilidad.
-    """
     uid = ev.get("id") + "@bot-citas"
     summary = ev.get("summary", "Cita")
     description = (ev.get("description") or "").replace("\n", "\\n")
     start = ev["start"]["dateTime"]
     end   = ev["end"]["dateTime"]
-
-    # Asegura datetime con tz y pásalo a UTC
     start_dt = datetime.fromisoformat(start.replace("Z","+00:00"))
     end_dt   = datetime.fromisoformat(end.replace("Z","+00:00"))
     dtstamp  = _to_utc_fmt(datetime.now(ZoneInfo("UTC")))
-
     ics = "\r\n".join([
-        "BEGIN:VCALENDAR",
-        "VERSION:2.0",
-        "PRODID:-//Bot Citas//EN",
-        "CALSCALE:GREGORIAN",
-        "METHOD:PUBLISH",
+        "BEGIN:VCALENDAR","VERSION:2.0","PRODID:-//Bot Citas//EN","CALSCALE:GREGORIAN","METHOD:PUBLISH",
         "BEGIN:VEVENT",
         f"UID:{uid}",
         f"DTSTAMP:{dtstamp}",
@@ -351,8 +342,7 @@ def build_ics_from_event(ev: dict):
         f"SUMMARY:{summary}",
         f"DESCRIPTION:{description}",
         "END:VEVENT",
-        "END:VCALENDAR",
-        ""
+        "END:VCALENDAR",""
     ])
     return ics
 
@@ -360,17 +350,10 @@ def build_ics_from_event(ev: dict):
 # Helpers Google Calendar
 # =========================
 def build_event_payload(nombre, start_dt, end_dt, telefono="", email="", comentario=""):
-    description_lines = [
-        "Tipo: Llamada saliente",
-        f"Nombre: {nombre}",
-    ]
-    if telefono:
-        description_lines.append(f"Teléfono: {telefono}")
-    if email:
-        description_lines.append(f"Email: {email}")
-    if comentario:
-        description_lines.append(f"Comentario: {comentario}")
-
+    description_lines = ["Tipo: Llamada saliente", f"Nombre: {nombre}"]
+    if telefono:  description_lines.append(f"Teléfono: {telefono}")
+    if email:     description_lines.append(f"Email: {email}")
+    if comentario:description_lines.append(f"Comentario: {comentario}")
     return {
         "summary": f"Llamada con {nombre}",
         "description": "\n".join(description_lines),
@@ -381,27 +364,21 @@ def build_event_payload(nombre, start_dt, end_dt, telefono="", email="", comenta
 def format_confirmation_message(nombre: str, start_dt, telefono: str | None):
     fecha_legible = start_dt.strftime("%d-%m-%Y %H:%M")
     tel_txt = f" al {telefono}" if telefono else ""
-    base = (
-        f"{COMPANY_NAME} — "
-        f"Listo {nombre}, agendé tu llamada para el {fecha_legible} (hora {TIMEZONE}). "
-        f"Un ejecutivo te contactará{tel_txt}. Dura 30 minutos. "
-        "Si necesitas cambiarla o cancelarla, avísame por aquí."
-    )
-    return base
+    return (f"{COMPANY_NAME} — "
+            f"Listo {nombre}, agendé tu llamada para el {fecha_legible} (hora {TIMEZONE}). "
+            f"Un ejecutivo te contactará{tel_txt}. Dura 30 minutos. "
+            "Si necesitas cambiarla o cancelarla, avísame por aquí.")
 
 def create_event_calendar(nombre, datetime_text=None, fecha=None, hora=None,
                           telefono="", email="", comentario="", allow_date_only=False):
-    """Crea evento (30 min). Devuelve (evento, mensaje o error). Requiere teléfono y email."""
     start_dt = parse_datetime_es({
         "datetime_text": datetime_text, "fecha": fecha, "hora": hora,
         "_allow_date_only": allow_date_only
     })
     if not start_dt:
         return None, "Para agendar necesito la fecha y la hora exactas (ejemplo: 12/08 13:00)."
-
-    # Teléfono y email son obligatorios
     telefono = (telefono or "").strip()
-    email = (email or "").strip()
+    email    = (email or "").strip()
     if not telefono:
         return None, "Me indicas tu número de teléfono para la llamada, por favor."
     if not email:
@@ -409,23 +386,11 @@ def create_event_calendar(nombre, datetime_text=None, fecha=None, hora=None,
 
     end_dt = start_dt + timedelta(minutes=30)
     event_body = build_event_payload(nombre or "Cliente", start_dt, end_dt, telefono, email, comentario)
+    created = gc_service.events().insert(calendarId=CALENDAR_ID, body=event_body, sendUpdates="none").execute()
 
-    created = gc_service.events().insert(
-        calendarId=CALENDAR_ID,
-        body=event_body,
-        sendUpdates="none",
-    ).execute()
-
-    # Links para el cliente
-    gcal_link = make_gcal_template_link(
-        summary=event_body["summary"],
-        start_dt=start_dt,
-        end_dt=end_dt,
-        description=event_body.get("description","")
-    )
-    # URL pública al .ics servido por este backend
+    gcal_link = make_gcal_template_link(event_body["summary"], start_dt, end_dt, event_body.get("description",""))
     try:
-        base = request.host_url.rstrip("/")  # requiere contexto de request
+        base = request.host_url.rstrip("/")
         ics_url = f"{base}/ics/{created.get('id')}.ics"
     except RuntimeError:
         ics_url = ""
@@ -437,7 +402,6 @@ def create_event_calendar(nombre, datetime_text=None, fecha=None, hora=None,
     created["gcalAddUrl"] = gcal_link
     return created, msg
 
-# --- EDITAR / ELIMINAR / REPROGRAMAR EVENTOS ---
 def update_event_calendar(event_id: str,
                           nombre: str | None = None,
                           datetime_text: str | None = None,
@@ -446,18 +410,14 @@ def update_event_calendar(event_id: str,
                           telefono: str | None = None,
                           email: str | None = None,
                           comentario: str | None = None):
-    """Actualiza campos de la cita. Si llega fecha/hora, reprograma a 30 min."""
     try:
         ev = gc_service.events().get(calendarId=CALENDAR_ID, eventId=event_id).execute()
     except HttpError:
         return None, f"No encontré la cita ({event_id})."
 
-    # 1) Reprogramar si llega nueva fecha/hora
     if any([datetime_text, fecha, hora]):
         start_dt = parse_datetime_es({
-            "datetime_text": (datetime_text or ""),
-            "fecha": (fecha or ""),
-            "hora": (hora or "")
+            "datetime_text": (datetime_text or ""), "fecha": (fecha or ""), "hora": (hora or "")
         })
         if not start_dt:
             return None, "No entendí la nueva fecha/hora. Ej: 12/08 13:00."
@@ -465,14 +425,11 @@ def update_event_calendar(event_id: str,
         ev["start"] = {"dateTime": start_dt.isoformat(), "timeZone": TIMEZONE}
         ev["end"]   = {"dateTime": end_dt.isoformat(),   "timeZone": TIMEZONE}
 
-    # 2) Cambiar nombre (summary)
     if nombre:
         ev["summary"] = f"Llamada con {nombre}"
 
-    # 3) (Re)construir descripción si llega alguno de estos campos
     touched_contact = any(v is not None for v in [telefono, email, comentario, nombre])
     if touched_contact:
-        # Usa los valores nuevos si vienen, si no, intenta conservar lo actual
         desc_prev = ev.get("description") or ""
         def pick(label, nuevo):
             if nuevo is not None and nuevo != "":
@@ -483,19 +440,16 @@ def update_event_calendar(event_id: str,
         telefono_desc = pick("Teléfono", telefono)
         email_desc    = pick("Email", email)
         coment_desc   = pick("Comentario", comentario)
-
         lines = ["Tipo: Llamada saliente", f"Nombre: {nombre_desc}"]
         if telefono_desc: lines.append(f"Teléfono: {telefono_desc}")
         if email_desc:    lines.append(f"Email: {email_desc}")
         if coment_desc:   lines.append(f"Comentario: {coment_desc}")
         ev["description"] = "\n".join(lines)
 
-    # 4) Guardar cambios
     updated = gc_service.events().update(calendarId=CALENDAR_ID, eventId=event_id, body=ev).execute()
     return updated, "Cita actualizada correctamente."
 
 def delete_event_calendar(event_id: str, calendar_id: str | None = None):
-    """Elimina la cita."""
     cal_id = calendar_id or CALENDAR_ID
     try:
         gc_service.events().delete(calendarId=cal_id, eventId=event_id, sendUpdates="none").execute()
@@ -504,12 +458,9 @@ def delete_event_calendar(event_id: str, calendar_id: str | None = None):
         return False, f"No pude eliminar la cita ({event_id}). {e.reason}"
 
 def extract_event_and_cal_from_eid(eid_or_link: str):
-    """
-    Acepta el 'eid' o el 'htmlLink' de Calendar y devuelve (event_id, calendar_id|None).
-    """
+    """Acepta el 'eid' o el 'htmlLink' y devuelve (event_id, calendar_id|None)."""
     if not eid_or_link:
         return None, None
-    # si viene un htmlLink, saca ?eid=...
     if eid_or_link.startswith("http"):
         try:
             q = parse_qs(urlparse(eid_or_link).query)
@@ -518,21 +469,50 @@ def extract_event_and_cal_from_eid(eid_or_link: str):
             eid = None
     else:
         eid = eid_or_link
-
     if not eid:
         return None, None
-
     try:
-        # base64 urlsafe sin padding
         pad = '=' * (-len(eid) % 4)
         decoded = base64.urlsafe_b64decode(eid + pad).decode("utf-8")
-        # formato: "<eventId> <calendarId>"
         parts = decoded.split(" ")
         event_id = parts[0] if parts else None
         cal_id = parts[1] if len(parts) > 1 else None
         return event_id, cal_id
     except Exception:
         return None, None
+
+# =========================
+# Cancelación: helpers
+# =========================
+CANCEL_RE = re.compile(r"\b(cancelar|anular|eliminar)\b.*\b(cita|llamada)\b", re.I)
+YES_RE = re.compile(r"^\s*(sí|si|ok|de acuerdo|confirmo|confirmar|adelante|proceder)\b", re.I)
+NO_RE  = re.compile(r"^\s*(no|cancelar no|mejor no|anular no)\b", re.I)
+
+def human_dt(dt_iso: str):
+    try:
+        dt = datetime.fromisoformat(dt_iso.replace("Z", "+00:00")).astimezone(ZoneInfo(TIMEZONE))
+        return dt.strftime("%d-%m-%Y %H:%M")
+    except Exception:
+        return dt_iso
+
+def find_event_id_by_datetime(dt_target, cal_id=None, tolerance_min=15):
+    """Busca un evento que empiece cerca de dt_target ±tolerance_min y tenga summary 'Llamada con ...'."""
+    cal_id = cal_id or CALENDAR_ID
+    tmin = (dt_target - timedelta(minutes=tolerance_min)).isoformat()
+    tmax = (dt_target + timedelta(minutes=tolerance_min)).isoformat()
+    resp = gc_service.events().list(
+        calendarId=cal_id,
+        timeMin=tmin,
+        timeMax=tmax,
+        singleEvents=True,
+        orderBy="startTime",
+        maxResults=5
+    ).execute()
+    for ev in (resp.get("items") or []):
+        if (ev.get("summary") or "").lower().startswith("llamada con"):
+            return ev.get("id"), ev
+    items = resp.get("items") or []
+    return (items[0].get("id"), items[0]) if items else (None, None)
 
 # =========================
 # Rutas básicas / formulario / .ics
@@ -606,7 +586,7 @@ def crear_cita_web():
         telefono=form.get("telefono"),
         email=form.get("email"),
         comentario=form.get("comentario"),
-        allow_date_only=True,  # si solo ponen fecha, por defecto 10:00
+        allow_date_only=True,
     )
     if not created:
         return msg, 400
@@ -674,7 +654,6 @@ def crear_cita_api():
         "mensaje_para_cliente": msg
     }), 201
 
-# PATCH /cita/<id>  (editar)
 @app.patch("/cita/<event_id>")
 def editar_cita(event_id):
     data = request.get_json(silent=True) or {}
@@ -697,7 +676,6 @@ def editar_cita(event_id):
         "end": updated.get("end"),
     }}), 200
 
-# DELETE /cita/<id>  (eliminar por ID directo)
 @app.delete("/cita/<event_id>")
 def eliminar_cita(event_id):
     ok, msg = delete_event_calendar(event_id)
@@ -705,40 +683,33 @@ def eliminar_cita(event_id):
         return jsonify({"ok": False, "error": msg}), 400
     return jsonify({"ok": True, "mensaje": msg}), 200
 
-# POST /cita/borrar (flex: event_id o htmlLink/eid)
 @app.post("/cita/borrar")
 def borrar_cita_flexible():
     data = request.get_json(silent=True) or {}
     event_id = (data.get("event_id") or "").strip()
     html_link = (data.get("htmlLink") or data.get("html_link") or "").strip()
     eid = (data.get("eid") or "").strip()
-
     cal_from_eid = None
     if not event_id:
         event_id, cal_from_eid = extract_event_and_cal_from_eid(html_link or eid)
-
     if not event_id:
         return jsonify({"ok": False, "error": "Falta event_id o htmlLink/eid válido."}), 400
-
     ok, msg = delete_event_calendar(event_id, calendar_id=cal_from_eid or CALENDAR_ID)
     if not ok:
         return jsonify({"ok": False, "error": msg}), 400
     return jsonify({"ok": True, "mensaje": "Cita eliminada.", "eventId": event_id}), 200
 
-# POST /cita/reprogramar (crea nueva y elimina anterior)
 @app.post("/cita/reprogramar")
 def reprogramar_cita():
     data = request.get_json(silent=True) or {}
     old_event_id = (data.get("event_id") or "").strip()
     html_link = (data.get("htmlLink") or data.get("html_link") or "").strip()
     eid = (data.get("eid") or "").strip()
-
     cal_from_eid = None
     if not old_event_id:
         old_event_id, cal_from_eid = extract_event_and_cal_from_eid(html_link or eid)
     cal_id = cal_from_eid or CALENDAR_ID
 
-    # intentar leer datos del evento anterior
     old = None
     if old_event_id:
         try:
@@ -746,16 +717,13 @@ def reprogramar_cita():
         except HttpError:
             old = None
 
-    # parsear contacto previo de la descripción
     def pick_from_desc(label, desc):
         if not desc:
             return ""
         m = re.search(fr"{label}:\s*(.+)", desc)
         return m.group(1).strip() if m else ""
 
-    nombre_old = ""
-    telefono_old = ""
-    email_old = ""
+    nombre_old = telefono_old = email_old = ""
     if old:
         desc_prev = old.get("description") or ""
         nombre_old = pick_from_desc("Nombre", desc_prev)
@@ -764,13 +732,11 @@ def reprogramar_cita():
         if not nombre_old:
             nombre_old = re.sub(r"^Llamada con\s*", "", old.get("summary","")).strip() or "Cliente"
 
-    # nuevos datos
     nombre   = (data.get("nombre") or nombre_old or "Cliente").strip()
     telefono = (data.get("telefono") or telefono_old).strip()
     email    = (data.get("email") or email_old).strip()
     comentario = (data.get("comentario") or "").strip()
 
-    # nueva fecha/hora
     created, msg = create_event_calendar(
         nombre=nombre,
         datetime_text=data.get("datetime_text"),
@@ -783,7 +749,6 @@ def reprogramar_cita():
     if not created:
         return jsonify({"ok": False, "error": msg}), 400
 
-    # eliminar la anterior si la teníamos identificada
     deleted = False
     del_error = None
     if old_event_id:
@@ -807,7 +772,7 @@ def reprogramar_cita():
     }), 200
 
 # =========================
-# Chatbot con GPT 3.5 — Orquestación
+# Chatbot con GPT 3.5 — Orquestación + Cancelación
 # =========================
 SYSTEM_PROMPT = (
     "Eres el asistente de agenda de una empresa de cobranza judicial. "
@@ -829,11 +794,7 @@ SYSTEM_PROMPT = (
 )
 
 def llm_orchestrate(history, slots, awaiting_confirm, candidate, user_message):
-    state = {
-        "slots": slots,
-        "awaiting_confirm": awaiting_confirm,
-        "candidate": candidate or {}
-    }
+    state = {"slots": slots, "awaiting_confirm": awaiting_confirm, "candidate": candidate or {}}
     messages = [
         {"role": "system", "content": SYSTEM_PROMPT},
         {"role": "system", "content": f"Estado actual: {json.dumps(state, ensure_ascii=False)}"},
@@ -871,11 +832,76 @@ def process_chat(session_id: str, user_msg: str, telefono: str = "", email: str 
     history = session["history"]
     slots = session["slots"]
     awaiting_confirm = session.get("awaiting_confirm", False)
-    candidate = session.get("candidate")
 
     if not user_msg:
         return {"reply": GREETING_TEXT, "done": False}
 
+    # --- CANCELACIÓN: confirmación y ejecución (antes del LLM) ---
+    cp = session.get("cancel_pending")
+    if cp:
+        if YES_RE.search(user_msg):
+            ok, msg_del = delete_event_calendar(cp["event_id"], calendar_id=cp.get("calendar_id"))
+            session["cancel_pending"] = None
+            if ok:
+                if session.get("last_event_id") == cp["event_id"]:
+                    session["last_event_id"] = None
+                reply = f"Listo, cancelé tu cita del {cp['when']}."
+                return {"reply": reply, "done": False}
+            else:
+                return {"reply": f"No pude cancelar la cita ({cp['event_id']}). {msg_del}", "done": False}
+        elif NO_RE.search(user_msg):
+            session["cancel_pending"] = None
+            return {"reply": "Perfecto, dejamos la cita tal como está.", "done": False}
+        return {"reply": f"¿Confirmas que deseas cancelar la cita del {cp['when']}? Responde “sí cancelar” o “no”.", "done": False}
+
+    if CANCEL_RE.search(user_msg):
+        # 1) última cita de la sesión
+        last_id = session.get("last_event_id")
+        if last_id:
+            try:
+                ev = gc_service.events().get(calendarId=CALENDAR_ID, eventId=last_id).execute()
+                when = human_dt((ev.get("start") or {}).get("dateTime", ""))
+                session["cancel_pending"] = {"event_id": last_id, "calendar_id": CALENDAR_ID, "when": when}
+                return {"reply": f"¿Confirmas que quieres cancelar la cita del {when}? Responde “sí cancelar” o “no”.", "done": False}
+            except HttpError:
+                pass
+
+        # 2) link o eid
+        m = re.search(r"(https?://www\.google\.com/calendar/event\?eid=[^\s]+)", user_msg)
+        eid = None
+        if m:
+            eid = m.group(1)
+        else:
+            m2 = re.search(r"\beid=([A-Za-z0-9_\-]+)", user_msg)
+            if m2:
+                eid = m2.group(1)
+        if eid:
+            ev_id, cal_id = extract_event_and_cal_from_eid(eid)
+            if ev_id:
+                try:
+                    ev = gc_service.events().get(calendarId=(cal_id or CALENDAR_ID), eventId=ev_id).execute()
+                    when = human_dt((ev.get("start") or {}).get("dateTime", ""))
+                    session["cancel_pending"] = {"event_id": ev_id, "calendar_id": cal_id or CALENDAR_ID, "when": when}
+                    return {"reply": f"¿Confirmas cancelar la cita del {when}? Responde “sí cancelar” o “no”.", "done": False}
+                except HttpError:
+                    return {"reply": "No pude localizar esa cita con el enlace. ¿Puedes darme la fecha y hora exactas (ej: 12/08 13:00)?", "done": False}
+
+        # 3) fecha/hora “cancela la del 12/08 13:00”
+        dt = parse_datetime_es({"datetime_text": user_msg})
+        if dt:
+            ev_id, ev = find_event_id_by_datetime(dt, CALENDAR_ID, tolerance_min=15)
+            if ev_id:
+                when = human_dt((ev.get("start") or {}).get("dateTime", ""))
+                session["cancel_pending"] = {"event_id": ev_id, "calendar_id": CALENDAR_ID, "when": when}
+                return {"reply": f"Voy a cancelar la cita del {when}. ¿Lo confirmas? (responde “sí cancelar” o “no”)", "done": False}
+            else:
+                return {"reply": "No encontré una cita en ese horario. ¿Puedes confirmar fecha y hora exactas (ej: 12/08 13:00) o pegar el link del evento?", "done": False}
+
+        # 4) pedir datos
+        return {"reply": "Para cancelar, indícame la fecha y hora de la cita (ej: 12/08 13:00) o pégame el link del evento.", "done": False}
+
+    # --- Orquestación normal con LLM ---
+    candidate = session.get("candidate")
     plan = llm_orchestrate(history, slots, awaiting_confirm, candidate, user_msg)
 
     # fusionar slots con lo detectado ahora
@@ -912,7 +938,6 @@ def process_chat(session_id: str, user_msg: str, telefono: str = "", email: str 
             "telefono": (cand.get("telefono") or slots.get("telefono") or telefono or "").strip(),
             "email": (cand.get("email") or slots.get("email") or email or "").strip(),
         }
-
         created, msg = create_event_calendar(
             nombre=cand_or_slots["nombre"],
             datetime_text=cand_or_slots["datetime_text"],
@@ -922,14 +947,13 @@ def process_chat(session_id: str, user_msg: str, telefono: str = "", email: str 
             email=cand_or_slots["email"],
             comentario=comentario,
         )
-
         session["awaiting_confirm"] = False
         session["candidate"] = None
         if not created:
             history += [{"role":"user","content":user_msg},{"role":"assistant","content":msg}]
             return {"reply": msg, "done": False}
 
-        # auto-borrar el último evento de esta sesión (reprogramación)
+        # auto-borrar último evento de la sesión (reprogramación)
         last_event_id = session.get("last_event_id")
         if last_event_id:
             try:
@@ -938,12 +962,11 @@ def process_chat(session_id: str, user_msg: str, telefono: str = "", email: str 
                 pass
         session["last_event_id"] = created.get("id")
 
-        # limpiar slots
+        # limpiar slots para próxima cita
         session["slots"] = {"nombre":"", "datetime_text":"", "fecha":"", "hora":"", "telefono":"", "email":""}
         history += [{"role":"user","content":user_msg},{"role":"assistant","content":msg}]
         return {"reply": msg, "done": True, "evento": created}
 
-    # smalltalk / ask_missing / none
     history += [{"role":"user","content":user_msg},{"role":"assistant","content":reply}]
     return {"reply": reply, "done": False}
 
@@ -1006,7 +1029,6 @@ def wa_incoming():
             if msg.get("type") == "text":
                 text = (msg.get("text", {}) or {}).get("body", "")
 
-            # Fallback: usa el número del remitente como teléfono si no lo entrega
             res = process_chat(session_id=from_id, user_msg=text, telefono=from_id)
 
             url = f"https://graph.facebook.com/v20.0/{phone_id}/messages"
@@ -1018,24 +1040,19 @@ def wa_incoming():
             if DEBUG_WA:
                 print("WA OUT <<<", r.status_code, r.text)
 
-            # 2) Si se creó la cita, enviar .ics y link "Añadir a Google Calendar"
+            # 2) Si se creó la cita, enviar .ics y link “Añadir a Google Calendar”
             if res.get("done") and res.get("evento"):
                 ev = res["evento"]
-                # Documento .ics
                 if ev.get("icsUrl"):
                     body_doc = {
                       "messaging_product": "whatsapp",
                       "to": from_id,
                       "type": "document",
-                      "document": {
-                        "link": ev["icsUrl"],
-                        "filename": "cita.ics"
-                      }
+                      "document": {"link": ev["icsUrl"], "filename": "cita.ics"}
                     }
                     rd = requests.post(url, headers=headers, json=body_doc, timeout=30)
                     if DEBUG_WA:
                         print("WA OUT DOC <<<", rd.status_code, rd.text)
-                # Link Añadir a GCal
                 if ev.get("gcalAddUrl"):
                     body_link = {
                       "messaging_product": "whatsapp",
