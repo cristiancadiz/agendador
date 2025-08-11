@@ -35,6 +35,10 @@ GREETING_TEXT = os.getenv(
     f"Hola 👋, somos {COMPANY_NAME}. Te ayudamos a agendar una llamada con un ejecutivo. ¿Cómo te llamas?"
 )
 
+# Horario de atención
+BUSINESS_START_HOUR = int(os.getenv("BUSINESS_START_HOUR", "9"))
+BUSINESS_END_HOUR   = int(os.getenv("BUSINESS_END_HOUR", "19"))
+
 # WhatsApp Cloud API
 WA_TOKEN = os.getenv("WA_TOKEN")
 WA_PHONE_ID = os.getenv("WA_PHONE_ID")  # fallback
@@ -305,6 +309,50 @@ def parse_datetime_es(payload: dict):
     return None
 
 # =========================
+# Horario de atención y disponibilidad
+# =========================
+def within_business_hours(start_dt, end_dt):
+    """
+    True si la cita cae completamente dentro del horario de atención.
+    Valida en la zona local (TIMEZONE) y mismo día.
+    """
+    local_start = start_dt.astimezone(ZoneInfo(TIMEZONE))
+    local_end   = end_dt.astimezone(ZoneInfo(TIMEZONE))
+
+    if local_start.date() != local_end.date():
+        return False, f"La cita debe quedar dentro del mismo día (horario de atención {BUSINESS_START_HOUR:02d}:00–{BUSINESS_END_HOUR:02d}:00)."
+
+    start_minutes = local_start.hour * 60 + local_start.minute
+    end_minutes   = local_end.hour * 60 + local_end.minute
+    open_minutes  = BUSINESS_START_HOUR * 60
+    close_minutes = BUSINESS_END_HOUR * 60
+
+    if start_minutes < open_minutes or end_minutes > close_minutes:
+        return False, f"Fuera de horario: atendemos de {BUSINESS_START_HOUR:02d}:00 a {BUSINESS_END_HOUR:02d}:00."
+    return True, ""
+
+def slot_is_free(start_dt, end_dt, calendar_id=None):
+    """
+    Usa FreeBusy de Google Calendar para verificar que no haya solapes.
+    Devuelve (True, "") si está libre; (False, "motivo") si está ocupado.
+    """
+    cal_id = calendar_id or CALENDAR_ID
+    try:
+        body = {
+            "timeMin": start_dt.isoformat(),
+            "timeMax": end_dt.isoformat(),
+            "timeZone": TIMEZONE,
+            "items": [{"id": cal_id}]
+        }
+        fb = gc_service.freebusy().query(body=body).execute()
+        busy = (fb.get("calendars", {}).get(cal_id, {}).get("busy") or [])
+        if busy:
+            return False, "Ese horario ya está ocupado en el calendario. ¿Te acomoda otra hora dentro del horario de atención?"
+        return True, ""
+    except HttpError as e:
+        return False, f"No pude verificar disponibilidad ({e.reason}). Intenta con otra hora."
+
+# =========================
 # Links “Añadir a GCal” y .ics
 # =========================
 def _to_utc_fmt(dt):
@@ -384,7 +432,19 @@ def create_event_calendar(nombre, datetime_text=None, fecha=None, hora=None,
     if not email:
         return None, "¿Cuál es tu correo electrónico? (lo usamos solo para respaldo de contacto)."
 
+    # 30 minutos
     end_dt = start_dt + timedelta(minutes=30)
+
+    # Horario de atención
+    ok_hours, msg_hours = within_business_hours(start_dt, end_dt)
+    if not ok_hours:
+        return None, msg_hours
+
+    # Disponibilidad (sin solapes)
+    ok_free, msg_free = slot_is_free(start_dt, end_dt, CALENDAR_ID)
+    if not ok_free:
+        return None, msg_free
+
     event_body = build_event_payload(nombre or "Cliente", start_dt, end_dt, telefono, email, comentario)
     created = gc_service.events().insert(calendarId=CALENDAR_ID, body=event_body, sendUpdates="none").execute()
 
@@ -422,6 +482,31 @@ def update_event_calendar(event_id: str,
         if not start_dt:
             return None, "No entendí la nueva fecha/hora. Ej: 12/08 13:00."
         end_dt = start_dt + timedelta(minutes=30)
+
+        # Evita rechazo cuando no cambia el horario
+        curr_start = ev.get("start", {}).get("dateTime")
+        curr_end   = ev.get("end", {}).get("dateTime")
+        same_as_now = False
+        try:
+            same_as_now = (
+                curr_start and curr_end and
+                datetime.fromisoformat(curr_start.replace("Z","+00:00")) == start_dt and
+                datetime.fromisoformat(curr_end.replace("Z","+00:00"))   == end_dt
+            )
+        except Exception:
+            same_as_now = False
+
+        # Horario de atención
+        ok_hours, msg_hours = within_business_hours(start_dt, end_dt)
+        if not ok_hours:
+            return None, msg_hours
+
+        # Disponibilidad si cambia el slot
+        if not same_as_now:
+            ok_free, msg_free = slot_is_free(start_dt, end_dt, CALENDAR_ID)
+            if not ok_free:
+                return None, msg_free
+
         ev["start"] = {"dateTime": start_dt.isoformat(), "timeZone": TIMEZONE}
         ev["end"]   = {"dateTime": end_dt.isoformat(),   "timeZone": TIMEZONE}
 
