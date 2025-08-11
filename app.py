@@ -169,7 +169,7 @@ CHAT_HTML = """
         <button id="send">Enviar</button>
       </div>
     </div>
-    <p class="hint" style="margin-left:6px">¿Prefieres formulario? <a href="/nuevo">abrir</a></p>
+    <p class="hint" style="margin-left:6px">¿Prefieres formulario? <a href="/nuevo">abrir</a> — <a href="/clases/stats.html" target="_blank">Estadísticas</a> — <a href="/clases/debug.html" target="_blank">Debug</a></p>
   </div>
 
 <script>
@@ -907,7 +907,8 @@ def _iter_class_events(tmin_dt: datetime, tmax_dt: datetime):
         ).execute()
         for ev in (resp.get("items") or []):
             extp = (ev.get("extendedProperties") or {}).get("private") or {}
-            if extp.get("type") == "class":
+            # Acepta eventos marcados como clase o cuyo título empiece con CLASS_TITLE_BASE
+            if extp.get("type") == "class" or ev.get("summary","").startswith(CLASS_TITLE_BASE):
                 yield ev
         page = resp.get("nextPageToken")
         if not page:
@@ -1214,6 +1215,62 @@ def clases_historial_html():
                     f"<td><a target='_blank' href='{link}'>ver</a></td></tr>")
     html.append("</table>")
     return Response("\n".join(html), headers={"Content-Type":"text/html; charset=utf-8"})
+
+
+# ======== DEBUG: ver eventos y participantes recientes ========
+@app.get("/clases/debug.html")
+def clases_debug_html():
+    tz = ZoneInfo(TIMEZONE)
+    now = datetime.now(tz)
+    tmin = now - timedelta(days=14)
+    tmax = now + timedelta(days=1)
+
+    rows = []
+    for ev in _iter_class_events(tmin, tmax):
+        extp = (ev.get("extendedProperties") or {}).get("private") or {}
+        parts = []
+        try:
+            parts = json.loads(extp.get("participants","[]"))
+        except Exception:
+            parts = []
+        rows.append({
+            "id": ev.get("id"),
+            "summary": ev.get("summary",""),
+            "start": (ev.get("start") or {}).get("dateTime",""),
+            "end": (ev.get("end") or {}).get("dateTime",""),
+            "type": extp.get("type",""),
+            "capacity": extp.get("capacity",""),
+            "participants": parts,
+            "htmlLink": ev.get("htmlLink","#"),
+        })
+
+    html = [
+        "<!doctype html><meta charset='utf-8'><title>Debug clases</title>",
+        "<style>body{font-family:system-ui;margin:24px} table{border-collapse:collapse} th,td{padding:6px 8px;border:1px solid #ddd;vertical-align:top} code{white-space:pre-wrap}</style>",
+        "<h1>Debug de clases (últimos 14 días)</h1>",
+        f"<p>Calendario: <code>{CALENDAR_ID}</code></p>",
+        "<table><tr><th>Fecha</th><th>Título</th><th>Type</th><th>Cap.</th><th>Participantes</th><th>Evento</th></tr>"
+    ]
+    for r in rows:
+        # fecha legible
+        f = ""
+        try:
+            f = datetime.fromisoformat(r["start"].replace("Z","+00:00")).astimezone(tz).strftime("%Y-%m-%d %H:%M")
+        except Exception:
+            f = r["start"]
+        plist = "<br>".join([f"- {p.get('nombre','(sin nombre)')}" for p in r["participants"]]) or "(vacío)"
+        html.append(
+            f"<tr>"
+            f"<td>{f}</td>"
+            f"<td>{r['summary']}</td>"
+            f"<td>{r['type']}</td>"
+            f"<td>{r['capacity']}</td>"
+            f"<td>{plist}</td>"
+            f"<td><a target='_blank' href='{r['htmlLink']}'>ver</a></td>"
+            f"</tr>"
+        )
+    html.append("</table>")
+    return Response("\n".join(html), headers={"Content-Type": "text/html; charset=utf-8"})
 
 
 # =========================
