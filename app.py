@@ -31,7 +31,7 @@ OPENAI_MODEL = "gpt-3.5-turbo"
 
 COMPANY_NAME = os.getenv("COMPANY_NAME", "CrossFit Box")
 
-# Ahora el saludo NO pide el nombre. Solo se presenta.
+# Saludo SOLO de presentación (no pide nombre)
 GREETING_TEXT = os.getenv(
     "GREETING_TEXT",
     f"Hola 👋, somos {COMPANY_NAME}. Te inscribimos en clases."
@@ -39,7 +39,7 @@ GREETING_TEXT = os.getenv(
 
 FALLBACK_REPLY = os.getenv(
     "FALLBACK_REPLY",
-    "Disculpa, no alcancé a entender 😅. ¿Me indicas tu nombre y la fecha/hora de la clase? (ej: 12/08 18:00)"
+    "Disculpa, no alcancé a entender 😅. ¿Me indicas tu nombre y la fecha/hora de la clase? (ej: 20/09 14:00)"
 )
 
 # Horario de clases: Lunes–Viernes 09:00–18:00, duración 60 min
@@ -61,7 +61,6 @@ _PROCESADOS = {}  # {message_id: expire_ts}
 
 def wa_is_dup(message_id: str) -> bool:
     now = time.time()
-    # limpia expirados
     for k, exp in list(_PROCESADOS.items()):
         if exp < now:
             _PROCESADOS.pop(k, None)
@@ -108,30 +107,51 @@ def _get_session(session_id: str):
             "awaiting_confirm": False,
             "candidate": None,
             "last_event_id": None,
-            # NUEVO: para pedir el nombre recién tras el primer mensaje
-            "asked_name": False,
+            "asked_name": False,  # pedimos el nombre tras el primer mensaje del usuario
         }
         SESSIONS[session_id] = s
     return s
 
 
 # =========================
-# Helper: detectar si es probable que el mensaje sea un NOMBRE
+# Detección de NOMBRE (con stopwords) + extracción "soy / me llamo"
 # =========================
+NAME_STOPWORDS = {
+    "hola","buenas","buen día","buen dia","buenos días","buenos dias",
+    "buenas tardes","buenas noches","hey","hello","hi","holi","holis",
+    "aló","alo","alooo","wenas","qué tal","que tal","gracias","ok","vale",
+    "sí","si","no","listo","listos","dale","perfecto","bien","hola!"
+}
+
+NAME_RE = r"[A-Za-zÁÉÍÓÚáéíóúÑñÜü'´`-]+(?:\s+[A-Za-zÁÉÍÓÚáéíóúÑñÜü'´`-]+){0,3}"
+
 def is_probable_name(text: str) -> bool:
     if not text:
         return False
-    t = text.strip()
+    t = re.sub(r"[!¡¿?.,:;…]+", " ", text).strip()
+    low = t.lower()
+    if low in NAME_STOPWORDS:
+        return False
     if any(ch.isdigit() for ch in t):
         return False
-    if len(t) > 60:
+    if len(t) < 2 or len(t) > 60:
         return False
-    # Acepta letras (con acentos), espacios, guiones y apóstrofes, hasta 4 palabras
-    return bool(re.fullmatch(r"[A-Za-zÁÉÍÓÚáéíóúÑñÜü'´`-]+(?:\s+[A-Za-zÁÉÍÓÚáéíóúÑñÜü'´`-]+){0,3}", t))
+    return bool(re.fullmatch(NAME_RE, t))
+
+def extract_name_from_text(text: str) -> str | None:
+    if not text:
+        return None
+    t = text.strip()
+    # patrones: "soy X", "yo soy X", "me llamo X", "mi nombre es X"
+    pat = re.compile(r"(?:^|\b)(?:yo\s+soy|soy|me\s+llamo|mi\s+nombre\s+es)\s+(" + NAME_RE + r")\b", re.IGNORECASE)
+    m = pat.search(t)
+    if m:
+        return m.group(1).strip()
+    return None
 
 
 # =========================
-# HTML: Chat Web (solo saludo inicial; el nombre se pide tras el 1er mensaje del usuario)
+# HTML Chat
 # =========================
 CHAT_HTML = """
 <!doctype html>
@@ -228,7 +248,7 @@ async function callBot(text){
   const data = await resp.json();
   const reply = (data.reply && data.reply.trim())
     ? data.reply
-    : 'Disculpa, no entendí 😅. ¿Tu nombre y fecha/hora? (ej: 12/08 18:00)';
+    : 'Disculpa, no entendí 😅. ¿Tu nombre y fecha/hora? (ej: 20/09 14:00)';
   addMsg(reply, 'bot');
   if (data.done && data.evento) {
     addEventCard(data.evento.htmlLink, data.evento.icsUrl, data.evento.gcalAddUrl);
@@ -248,7 +268,7 @@ box.addEventListener('keydown', (e)=>{
   if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendNow(); }
 });
 
-// Mensaje inicial: SOLO presentación (sin pedir nombre)
+// Saludo inicial solo de presentación
 addMsg({{ greeting|tojson }});
 </script>
 </body>
@@ -268,13 +288,6 @@ def _has_time_token(text: str) -> bool:
     return bool(re.search(r"\b\d{1,2}(:\d{2})?\s*(am|pm)?\b", t))
 
 def parse_datetime_es(payload: dict):
-    """
-    Convierte texto o (fecha+hora) a datetime con tz.
-    - DATE_ORDER=DMY
-    - Normaliza '13 horas/hrs', 'a las 13' y '13' (al final) -> '13:00'
-    - Requiere hora explícita en texto natural
-    - Prefiere futuro; usa TZ local
-    """
     now = datetime.now(ZoneInfo(TIMEZONE))
     settings = {
         "PREFER_DATES_FROM": "future",
@@ -313,13 +326,10 @@ def within_class_hours(start_dt, end_dt):
     local_start = start_dt.astimezone(ZoneInfo(TIMEZONE))
     local_end   = end_dt.astimezone(ZoneInfo(TIMEZONE))
 
-    # Lunes=0 ... Domingo=6
     if local_start.weekday() >= 5 or local_end.weekday() >= 5:
         return False, "Las clases son de lunes a viernes."
-    # mismo día
     if local_start.date() != local_end.date():
         return False, "La clase debe quedar dentro del mismo día."
-    # 09:00–18:00
     sm = local_start.hour * 60 + local_start.minute
     em = local_end.hour * 60 + local_end.minute
     if sm < BUSINESS_START_HOUR*60 or em > BUSINESS_END_HOUR*60:
@@ -370,7 +380,7 @@ def build_ics_from_event(ev: dict):
 
 
 # =========================
-# Helpers de “clase con múltiples participantes” (con wa_id)
+# Helpers de “clase con múltiples participantes”
 # =========================
 def _load_participants(ev):
     extp = (ev.get("extendedProperties") or {}).get("private") or {}
@@ -388,11 +398,9 @@ def _save_participants(ev, participants, capacity, title=None):
     extp_priv["participants"] = json.dumps(participants, ensure_ascii=False)
     ev.setdefault("extendedProperties", {})["private"] = extp_priv
 
-    # Actualiza título con contador
     if title:
         ev["summary"] = f"{title} ({len(participants)}/{capacity})"
 
-    # Description legible
     lines = [ev.get("description") or "Tipo: Clase de CrossFit", "Participantes:"]
     for p in participants:
         pname = p.get('nombre','')
@@ -438,7 +446,6 @@ def enroll_in_class(nombre, start_dt, end_dt, capacidad=None, titulo=None, wa_id
     def _norm(n): 
         return re.sub(r"\s+", " ", (n or "").strip().lower())
 
-    # Dedupe por wa_id primero; si no hay, por nombre
     for p in participants:
         if wa_id and p.get("wa_id") == wa_id:
             hora_txt = start_dt.astimezone(ZoneInfo(TIMEZONE)).strftime("%H:%M")
@@ -464,7 +471,6 @@ def enroll_in_class(nombre, start_dt, end_dt, capacidad=None, titulo=None, wa_id
     if len(participants) >= curr_cap:
         return None, f"La clase ya está completa ({len(participants)}/{curr_cap}). ¿Quieres otra hora?"
 
-    # Agregar participante
     participants.append({
         "nombre": nombre,
         "wa_id": wa_id or "",
@@ -486,7 +492,7 @@ def enroll_in_class(nombre, start_dt, end_dt, capacidad=None, titulo=None, wa_id
 
 
 # =========================
-# Chatbot con GPT 3.5 — pedir nombre DESPUÉS del primer mensaje
+# Chatbot con GPT 3.5 — pide el nombre DESPUÉS del primer mensaje
 # =========================
 SYSTEM_PROMPT = (
     "Eres el asistente de inscripciones de un box de CrossFit. "
@@ -516,7 +522,6 @@ def llm_orchestrate(history, slots, awaiting_confirm, candidate, user_message):
     messages.append({"role": "user", "content": user_message})
     messages.append({"role": "system", "content": "Devuelve SOLO el JSON indicado, sin texto adicional."})
 
-    # Manejo robusto de errores del LLM
     try:
         resp = oa_client.chat.completions.create(model=OPENAI_MODEL, temperature=0.3, messages=messages)
         raw = (resp.choices[0].message.content or "").strip()
@@ -539,7 +544,6 @@ def llm_orchestrate(history, slots, awaiting_confirm, candidate, user_message):
             if isinstance(v, str):
                 data["candidate"][k] = v.strip()
 
-    # Nunca devolver reply vacío
     if not data["reply"]:
         data["reply"] = FALLBACK_REPLY
     return data
@@ -552,71 +556,77 @@ def process_chat(session_id: str, user_msg: str, wa_id: str | None = None):
     awaiting_confirm = session.get("awaiting_confirm", False)
 
     if not user_msg:
-        # Solo presentación al inicio
         return {"reply": GREETING_TEXT, "done": False}
 
-    # ======== LÓGICA DE “PEDIR NOMBRE TRAS 1er MENSAJE” ========
+    # ======== pedir/extraer nombre tras el 1er mensaje ========
     if not slots.get("nombre"):
-        # Si el mensaje YA parece un nombre, lo tomamos y pedimos fecha/hora
-        if is_probable_name(user_msg):
-            slots["nombre"] = user_msg.strip().title()
-            reply = f"Gracias, {slots['nombre']}. ¿Qué día y hora te acomoda? (ej: 12/08 18:00)"
+        # 1) ¿Viene explícito? (soy / me llamo / mi nombre es)
+        extracted = extract_name_from_text(user_msg)
+        if extracted and is_probable_name(extracted):
+            slots["nombre"] = extracted.title()
+            reply = f"Gracias, {slots['nombre']}. ¿Qué día y hora te acomoda? (ej: 20/09 14:00)"
             history += [{"role": "user", "content": user_msg}, {"role": "assistant", "content": reply}]
             session["asked_name"] = True
             return {"reply": reply, "done": False}
 
-        # Si aún no hemos pedido el nombre, lo pedimos ahora (primer turno del usuario)
+        # 2) ¿El mensaje parece un nombre (excluyendo saludos)?
+        if is_probable_name(user_msg):
+            slots["nombre"] = user_msg.strip().title()
+            reply = f"Gracias, {slots['nombre']}. ¿Qué día y hora te acomoda? (ej: 20/09 14:00)"
+            history += [{"role": "user", "content": user_msg}, {"role": "assistant", "content": reply}]
+            session["asked_name"] = True
+            return {"reply": reply, "done": False}
+
+        # 3) Si todavía no lo pedimos, pidámoslo ahora
         if not session.get("asked_name"):
             session["asked_name"] = True
             reply = "Gracias por escribir. ¿Podrías indicarme tu nombre completo?"
             history += [{"role": "user", "content": user_msg}, {"role": "assistant", "content": reply}]
             return {"reply": reply, "done": False}
 
-        # Ya pedimos el nombre antes y aún no llega uno válido
+        # 4) Reinsistir amablemente
         reply = "Para continuar, ¿me indicas por favor tu nombre completo?"
         history += [{"role": "user", "content": user_msg}, {"role": "assistant", "content": reply}]
         return {"reply": reply, "done": False}
 
-    # ---- FAST PATH: ya tenemos NOMBRE y el mensaje parece FECHA/HORA, intentamos crear
-    if slots.get("nombre"):
-        dt_try = parse_datetime_es({"datetime_text": user_msg})
-        if dt_try:
-            start_dt = dt_try
-            end_dt = start_dt + timedelta(minutes=CLASS_DURATION_MIN)
-            ok_hours, msg_hours = within_class_hours(start_dt, end_dt)
-            if not ok_hours:
-                history += [{"role": "user", "content": user_msg}, {"role": "assistant", "content": msg_hours}]
-                return {"reply": msg_hours, "done": False}
+    # ---- Con NOMBRE: intentar parsear fecha/hora directo
+    dt_try = parse_datetime_es({"datetime_text": user_msg})
+    if dt_try:
+        start_dt = dt_try
+        end_dt = start_dt + timedelta(minutes=CLASS_DURATION_MIN)
+        ok_hours, msg_hours = within_class_hours(start_dt, end_dt)
+        if not ok_hours:
+            history += [{"role": "user", "content": user_msg}, {"role": "assistant", "content": msg_hours}]
+            return {"reply": msg_hours, "done": False}
 
-            ev, msg = enroll_in_class(
-                nombre=slots["nombre"],
-                start_dt=start_dt,
-                end_dt=end_dt,
-                capacidad=None,
-                titulo=None,
-                wa_id=wa_id
-            )
-            if not ev:
-                history += [{"role": "user", "content": user_msg}, {"role": "assistant", "content": msg}]
-                return {"reply": msg, "done": False}
-
-            session["last_event_id"] = ev.get("id")
-            # reset slots tras inscribir
-            session["slots"] = {"nombre":"", "datetime_text":"", "fecha":"", "hora":""}
-            session["awaiting_confirm"] = False
-            session["candidate"] = None
-
+        ev, msg = enroll_in_class(
+            nombre=slots["nombre"],
+            start_dt=start_dt,
+            end_dt=end_dt,
+            capacidad=None,
+            titulo=None,
+            wa_id=wa_id
+        )
+        if not ev:
             history += [{"role": "user", "content": user_msg}, {"role": "assistant", "content": msg}]
-            return {"reply": msg, "done": True, "evento": {
-                "id": ev.get("id"),
-                "htmlLink": ev.get("htmlLink"),
-                "start": ev.get("start"),
-                "end": ev.get("end"),
-                "icsUrl": ev.get("icsUrl"),
-                "gcalAddUrl": ev.get("gcalAddUrl"),
-            }}
+            return {"reply": msg, "done": False}
 
-    # ---- Si no tomó FAST PATH, usamos el LLM (con fallback amable siempre)
+        session["last_event_id"] = ev.get("id")
+        session["slots"] = {"nombre":"", "datetime_text":"", "fecha":"", "hora":""}
+        session["awaiting_confirm"] = False
+        session["candidate"] = None
+
+        history += [{"role": "user", "content": user_msg}, {"role": "assistant", "content": msg}]
+        return {"reply": msg, "done": True, "evento": {
+            "id": ev.get("id"),
+            "htmlLink": ev.get("htmlLink"),
+            "start": ev.get("start"),
+            "end": ev.get("end"),
+            "icsUrl": ev.get("icsUrl"),
+            "gcalAddUrl": ev.get("gcalAddUrl"),
+        }}
+
+    # ---- Si no se pudo, usa LLM para seguir la conversación
     plan = llm_orchestrate(history, slots, awaiting_confirm, session.get("candidate"), user_msg)
 
     new_slots = plan.get("slots", {})
@@ -653,7 +663,7 @@ def process_chat(session_id: str, user_msg: str, wa_id: str | None = None):
             "hora": cand_or_slots["hora"],
         })
         if not start_dt:
-            msg = "Para inscribirte necesito la fecha y la hora exactas (ej: 12/08 18:00)."
+            msg = "Para inscribirte necesito la fecha y la hora exactas (ej: 20/09 14:00)."
             history += [{"role":"user","content":user_msg},{"role":"assistant","content":msg}]
             return {"reply": msg, "done": False}
 
@@ -703,7 +713,7 @@ def root():
 
 @app.get("/chat")
 def chat_ui():
-    subtitle = "Indícame tu <b>nombre</b> y la <b>fecha/hora</b> de la clase (ej: <code>12/08 a las 18 horas</code>)."
+    subtitle = "Indícame tu <b>nombre</b> y la <b>fecha/hora</b> de la clase (ej: <code>20/09 14:00</code>)."
     return render_template_string(
         CHAT_HTML,
         tz=TIMEZONE,
@@ -720,7 +730,7 @@ def chatbot():
     res = process_chat(
         session_id=(data.get("session_id") or "default"),
         user_msg=(data.get("message") or "").strip(),
-        wa_id=None  # en chat web no tenemos wa_id
+        wa_id=None
     )
     return jsonify(res)
 
@@ -849,18 +859,16 @@ def wa_incoming():
                     print("WA DUP >>>", message_id)
                 continue
 
-            from_id = msg.get("from")  # este es el wa_id del usuario
+            from_id = msg.get("from")
             text = ""
             if msg.get("type") == "text":
                 text = (msg.get("text", {}) or {}).get("body", "")
 
-            # Pasamos wa_id para dedupe y estadística
             res = process_chat(session_id=from_id, user_msg=text, wa_id=from_id)
 
             url = f"https://graph.facebook.com/v20.0/{phone_id}/messages"
             headers = {"Authorization": f"Bearer {WA_TOKEN}", "Content-Type": "application/json"}
 
-            # Nunca enviar "..." si algo falló
             safe_reply = (res.get("reply") or "").strip() if isinstance(res, dict) else ""
             if not safe_reply:
                 safe_reply = FALLBACK_REPLY
@@ -904,7 +912,7 @@ def wa_incoming():
 
 
 # =========================
-# STATS: clases por persona (nombre o wa_id)
+# STATS / HISTORIAL (igual que antes, sin cambios de lógica)
 # =========================
 def _normalize_name(n: str) -> str:
     return re.sub(r"\s+", " ", (n or "").strip().lower())
@@ -930,7 +938,6 @@ def _iter_class_events(tmin_dt: datetime, tmax_dt: datetime):
         ).execute()
         for ev in (resp.get("items") or []):
             extp = (ev.get("extendedProperties") or {}).get("private") or {}
-            # Acepta eventos marcados como clase o cuyo título empiece con CLASS_TITLE_BASE
             if extp.get("type") == "class" or ev.get("summary","").startswith(CLASS_TITLE_BASE):
                 yield ev
         page = resp.get("nextPageToken")
@@ -961,7 +968,6 @@ def _class_stats(tmin_dt: datetime, tmax_dt: datetime, group_by="name"):
             start_dt = None
 
         participants, _ = _load_participants(ev)
-        # dedupe por (evento, key)
         seen_keys_in_event = set()
         for p in participants:
             name = (p.get("nombre") or "").strip()
@@ -993,8 +999,8 @@ def _class_stats(tmin_dt: datetime, tmax_dt: datetime, group_by="name"):
 def clases_stats_json():
     tz = ZoneInfo(TIMEZONE)
     now = datetime.now(tz)
-    start_s = request.args.get("start")  # YYYY-MM-DD
-    end_s   = request.args.get("end")    # YYYY-MM-DD
+    start_s = request.args.get("start")
+    end_s   = request.args.get("end")
     group_by = (request.args.get("group_by") or "name").lower()
 
     if start_s:
@@ -1009,7 +1015,6 @@ def clases_stats_json():
         if not d1: return jsonify({"ok": False, "error": "end inválido (YYYY-MM-DD)"}), 400
         tmax = datetime(d1.year, d1.month, d1.day, 23, 59, 59, tzinfo=tz)
     else:
-        # INCLUIR futuro por defecto (90 días)
         tmax = now + timedelta(days=90)
 
     rows = _class_stats(tmin, tmax, group_by=group_by)
@@ -1037,7 +1042,6 @@ def clases_stats_csv():
         if not d1: return "end inválido", 400
         tmax = datetime(d1.year, d1.month, d1.day, 23, 59, 59, tzinfo=tz)
     else:
-        # INCLUIR futuro por defecto (90 días)
         tmax = now + timedelta(days=90)
 
     rows = _class_stats(tmin, tmax, group_by=group_by)
@@ -1072,7 +1076,6 @@ def clases_stats_html():
         if not d1: return "end inválido", 400
         tmax = datetime(d1.year, d1.month, d1.day, 23, 59, 59, tzinfo=tz)
     else:
-        # INCLUIR futuro por defecto (90 días)
         tmax = now + timedelta(days=90)
 
     rows = _class_stats(tmin, tmax, group_by=group_by)
@@ -1088,12 +1091,10 @@ def clases_stats_html():
     ]
 
     for r in rows:
-        # Construir link al historial según agrupación:
         if group_by == "wa" and r["key"].startswith("wa:"):
-            ident = r["key"][3:]  # quita "wa:"
+            ident = r["key"][3:]
             hist_q = f"wa_id={quote(ident)}"
         else:
-            # agrupado por nombre
             hist_q = f"name={quote(r['nombre'])}"
 
         if start_s:
@@ -1118,7 +1119,7 @@ def clases_stats_html():
     return Response("\n".join(html), headers={"Content-Type":"text/html; charset=utf-8"})
 
 
-# ======== HISTORIAL: clases por persona (wa_id o nombre) ========
+# ======== HISTORIAL ========
 def _class_history(tmin_dt: datetime, tmax_dt: datetime, wa_id: str | None = None, name: str | None = None):
     if not wa_id and not name:
         return []
@@ -1173,7 +1174,6 @@ def _parse_date_qs(param_value: str | None, default_dt: datetime):
 def clases_historial_json():
     tz = ZoneInfo(TIMEZONE)
     now = datetime.now(tz)
-    # rango por defecto: últimos 90 días hasta 90 días a futuro
     d0 = request.args.get("start")
     d1 = request.args.get("end")
     wa  = request.args.get("wa_id")
@@ -1184,7 +1184,6 @@ def clases_historial_json():
     if not tmin or not tmax:
         return jsonify({"ok": False, "error": "start/end inválidos (YYYY-MM-DD)"}), 400
 
-    # normaliza a 00:00 y 23:59
     tmin = tmin.replace(hour=0, minute=0, second=0)
     tmax = tmax.replace(hour=23, minute=59, second=59)
 
@@ -1207,7 +1206,6 @@ def clases_historial_html():
     wa  = request.args.get("wa_id")
     nm  = request.args.get("name")
 
-    # rango por defecto: últimos 90 días hasta 90 días a futuro
     tmin = _parse_date_qs(d0, now - timedelta(days=90))
     tmax = _parse_date_qs(d1, now + timedelta(days=90))
     if not tmin or not tmax:
@@ -1227,7 +1225,6 @@ def clases_historial_html():
         "<table><tr><th>Fecha</th><th>Inicio</th><th>Término</th><th>Nombre</th><th>Evento</th></tr>"
     ]
     for r in rows:
-        # fecha legible
         try:
             ini = datetime.fromisoformat(r["inicio"]).astimezone(tz)
             fin = datetime.fromisoformat(r["termino"]).astimezone(tz)
@@ -1244,7 +1241,9 @@ def clases_historial_html():
     return Response("\n".join(html), headers={"Content-Type":"text/html; charset=utf-8"})
 
 
-# ======== DEBUG: ver eventos y participantes recientes ========
+# =========================
+# Debug
+# =========================
 @app.get("/clases/debug.html")
 def clases_debug_html():
     tz = ZoneInfo(TIMEZONE)
@@ -1279,8 +1278,6 @@ def clases_debug_html():
         "<table><tr><th>Fecha</th><th>Título</th><th>Type</th><th>Cap.</th><th>Participantes</th><th>Evento</th></tr>"
     ]
     for r in rows:
-        # fecha legible
-        f = ""
         try:
             f = datetime.fromisoformat(r["start"].replace("Z","+00:00")).astimezone(tz).strftime("%Y-%m-%d %H:%M")
         except Exception:
@@ -1301,7 +1298,7 @@ def clases_debug_html():
 
 
 # =========================
-# Main dev
+# Main
 # =========================
 if __name__ == "__main__":
     import argparse
