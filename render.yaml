@@ -1,0 +1,15 @@
+services:
+  - type: web
+    name: bot-citas
+    runtime: python
+    plan: free
+    region: oregon
+    envVars:
+      - key: TIMEZONE
+        value: America/Santiago
+      - key: GOOGLE_CALENDAR_ID
+        sync: false
+      - key: GOOGLE_SERVICE_ACCOUNT_JSON
+        sync: false
+    buildCommand: "pip install -r requirements.txt"
+    startCommand: "gunicorn app:app --preload"
