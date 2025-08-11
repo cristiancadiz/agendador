@@ -1,13 +1,13 @@
 import os
 import json
 from datetime import timedelta
-from zoneinfo import ZoneInfo
 
 from flask import Flask, request, jsonify
 import dateparser
 
 from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
+from googleapiclient.errors import HttpError
 
 # ====== Config ======
 TIMEZONE = os.getenv("TIMEZONE", "America/Santiago")
@@ -28,7 +28,6 @@ service = build("calendar", "v3", credentials=creds, cache_discovery=False)
 # ====== App ======
 app = Flask(__name__)
 
-
 def parse_datetime_es(payload: dict):
     """Parsea fecha/hora en español a datetime consciente de zona."""
     settings = {
@@ -41,36 +40,38 @@ def parse_datetime_es(payload: dict):
         dt = dateparser.parse(dt_text, languages=["es"], settings=settings)
         if dt:
             return dt
+
     fecha = payload.get("fecha")
     hora = payload.get("hora")
     if fecha and hora:
         dt = dateparser.parse(f"{fecha} {hora}", languages=["es"], settings=settings)
         if dt:
             return dt
+
     if fecha and not hora:
         dt = dateparser.parse(f"{fecha} 10:00", languages=["es"], settings=settings)
         if dt:
             return dt
-    return None
 
+    return None
 
 @app.get("/")
 def health():
     return "OK - Bot de Citas ejecutándose", 200
 
+@app.get("/_diag")
+def diag():
+    """Diagnóstico mínimo para revisar configuración."""
+    return jsonify({
+        "ok": True,
+        "calendar_id": CALENDAR_ID,
+        "timezone": TIMEZONE,
+        "service_account_email": info.get("client_email"),
+    })
 
 @app.post("/cita")
 def crear_cita():
-    """Crea una cita en Google Calendar.
-
-    Ejemplos de body JSON:
-    1) Texto natural:
-       {"nombre":"Pilar","datetime_text":"mañana a las 13:00","duracion_minutos":45,
-        "email":"pilar@example.com","telefono":"+56912345678","comentario":"Asesoría"}
-
-    2) Fecha/hora separadas:
-       {"nombre":"Juan","fecha":"2025-08-12","hora":"09:30","duracion_minutos":30}
-    """
+    """Crea una cita en Google Calendar (o preview si 'dry_run': true)."""
     data = request.get_json(silent=True) or {}
 
     nombre = (data.get("nombre") or "Cliente").strip()
@@ -78,10 +79,11 @@ def crear_cita():
     email = (data.get("email") or "").strip()
     telefono = (data.get("telefono") or "").strip()
     comentario = (data.get("comentario") or "").strip()
+    dry_run = bool(data.get("dry_run"))
 
     start_dt = parse_datetime_es(data)
     if not start_dt:
-        return jsonify({"ok": False, "error": "No pude entender la fecha/hora."}), 400
+        return jsonify({"ok": False, "where": "parse_datetime", "error": "No pude entender la fecha/hora."}), 400
 
     end_dt = start_dt + timedelta(minutes=duracion)
 
@@ -104,11 +106,40 @@ def crear_cita():
     if attendees:
         event_body["attendees"] = attendees
 
-    created = service.events().insert(
-        calendarId=CALENDAR_ID,
-        body=event_body,
-        sendUpdates="all",  # enviará invitación si hay email
-    ).execute()
+    if dry_run:
+        fecha_legible = start_dt.strftime("%d-%m-%Y %H:%M")
+        return jsonify({
+            "ok": True,
+            "dry_run": True,
+            "evento_preview": event_body,
+            "mensaje_para_cliente": f"[PREVIEW] {nombre}, tu cita sería el {fecha_legible} (hora {TIMEZONE})."
+        })
+
+    try:
+        created = service.events().insert(
+            calendarId=CALENDAR_ID,
+            body=event_body,
+            sendUpdates="all",
+        ).execute()
+    except HttpError as e:
+        status = getattr(e, "status_code", None) or (getattr(e, "resp", None).status if getattr(e, "resp", None) else 500)
+        try:
+            detail = e.content.decode() if hasattr(e, "content") and isinstance(e.content, (bytes, bytearray)) else str(e)
+        except Exception:
+            detail = str(e)
+        return jsonify({
+            "ok": False,
+            "where": "google_insert",
+            "status": int(status),
+            "error": "Google API error",
+            "details": detail
+        }), 502
+    except Exception as e:
+        return jsonify({
+            "ok": False,
+            "where": "unexpected",
+            "error": f"{type(e).__name__}: {e}"
+        }), 500
 
     fecha_legible = start_dt.strftime("%d-%m-%Y %H:%M")
     return jsonify({
@@ -125,14 +156,10 @@ def crear_cita():
         )
     }), 201
 
-
-# =====================
-# Template de PRUEBAS
-# =====================
 if __name__ == "__main__":
     import argparse
 
-    parser = argparse.ArgumentParser(description="Bot de Citas - servidor y pruebas")
+    parser = argparse.ArgumentParser(description="Bot de Citas - servidor y pruebas (con diag y dry-run)")
     parser.add_argument("--runserver", action="store_true", help="Levanta el servidor Flask localmente")
     parser.add_argument("--test", action="store_true", help="Ejecuta una prueba contra el endpoint /cita")
     parser.add_argument("--url", default=os.getenv("BOT_URL", "http://localhost:8000/cita"),
@@ -147,16 +174,15 @@ if __name__ == "__main__":
     parser.add_argument("--email", help="Email del cliente (opcional)")
     parser.add_argument("--telefono", help="Teléfono del cliente (opcional)")
     parser.add_argument("--comentario", help="Comentario/notas (opcional)")
+    parser.add_argument("--dry_run", action="store_true", help="No inserta en Google; solo preview")
 
     args = parser.parse_args()
 
     if args.runserver:
-        # Ejecutar servidor local
         port = int(os.getenv("PORT", 8000))
         app.run(host="0.0.0.0", port=port)
 
     elif args.test:
-        # Enviar prueba al endpoint /cita
         try:
             import requests
         except ImportError:
@@ -172,6 +198,8 @@ if __name__ == "__main__":
             payload["telefono"] = args.telefono
         if args.comentario:
             payload["comentario"] = args.comentario
+        if args.dry_run:
+            payload["dry_run"] = True
 
         if args.modo == "natural":
             if not args.texto:
@@ -195,6 +223,5 @@ if __name__ == "__main__":
             print(json.dumps(resp.json(), indent=2, ensure_ascii=False))
         except ValueError:
             print(resp.text)
-
     else:
         parser.print_help()
