@@ -2,10 +2,9 @@ import os
 import re
 import json
 import time
-import base64
 from datetime import timedelta, datetime, date
 from zoneinfo import ZoneInfo
-from urllib.parse import quote, urlparse, parse_qs
+from urllib.parse import quote
 
 from flask import Flask, request, jsonify, render_template_string, redirect, Response
 import dateparser
@@ -800,8 +799,6 @@ def wa_incoming():
 # =========================
 # STATS: clases por persona (nombre o wa_id)
 # =========================
-from collections import defaultdict
-
 def _normalize_name(n: str) -> str:
     return re.sub(r"\s+", " ", (n or "").strip().lower())
 
@@ -968,12 +965,169 @@ def clases_stats_html():
         tmax = now
 
     rows = _class_stats(tmin, tmax, group_by=group_by)
-    html = ["<!doctype html><meta charset='utf-8'><title>Stats clases</title>"]
-    html.append("<style>body{font-family:system-ui;margin:24px} table{border-collapse:collapse} th,td{padding:8px 10px;border:1px solid #ddd}</style>")
-    html.append(f"<h1>Estadísticas de clases</h1><p>Desde {tmin.strftime('%Y-%m-%d')} hasta {tmax.strftime('%Y-%m-%d')} (agrupado por: <b>{group_by}</b>)</p>")
-    html.append("<table><tr><th>Clave</th><th>Nombre</th><th>Clases</th><th>Primera</th><th>Última</th></tr>")
+
+    html = [
+        "<!doctype html><meta charset='utf-8'><title>Stats clases</title>",
+        "<style>body{font-family:system-ui;margin:24px} table{border-collapse:collapse} th,td{padding:8px 10px;border:1px solid #ddd} ",
+        ".btn{display:inline-block;padding:6px 10px;border-radius:8px;background:#0ea5e9;color:#fff;text-decoration:none;font-weight:600} ",
+        ".btn:hover{filter:brightness(0.95)}",
+        "</style>",
+        f"<h1>Estadísticas de clases</h1><p>Desde {tmin.strftime('%Y-%m-%d')} hasta {tmax.strftime('%Y-%m-%d')} (agrupado por: <b>{group_by}</b>)</p>",
+        "<table><tr><th>Clave</th><th>Nombre</th><th>Clases</th><th>Primera</th><th>Última</th><th>Historial</th></tr>"
+    ]
+
     for r in rows:
-        html.append(f"<tr><td>{r['key']}</td><td>{r['nombre']}</td><td>{r['clases']}</td><td>{r['primera']}</td><td>{r['ultima']}</td></tr>")
+        # Construir link al historial según agrupación:
+        if group_by == "wa" and r["key"].startswith("wa:"):
+            ident = r["key"][3:]  # quita "wa:"
+            hist_q = f"wa_id={quote(ident)}"
+        else:
+            # agrupado por nombre
+            hist_q = f"name={quote(r['nombre'])}"
+
+        if start_s:
+            hist_q += f"&start={quote(start_s)}"
+        if end_s:
+            hist_q += f"&end={quote(end_s)}"
+
+        hist_url = f"/clases/historial.html?{hist_q}"
+
+        html.append(
+            f"<tr>"
+            f"<td>{r['key']}</td>"
+            f"<td>{r['nombre']}</td>"
+            f"<td>{r['clases']}</td>"
+            f"<td>{r['primera']}</td>"
+            f"<td>{r['ultima']}</td>"
+            f"<td><a class='btn' target='_blank' href='{hist_url}'>Ver historial</a></td>"
+            f"</tr>"
+        )
+
+    html.append("</table>")
+    return Response("\n".join(html), headers={"Content-Type":"text/html; charset=utf-8"})
+
+
+# ======== HISTORIAL: clases por persona (wa_id o nombre) ========
+def _class_history(tmin_dt: datetime, tmax_dt: datetime, wa_id: str | None = None, name: str | None = None):
+    if not wa_id and not name:
+        return []
+
+    tz = ZoneInfo(TIMEZONE)
+    rows = []
+
+    for ev in _iter_class_events(tmin_dt, tmax_dt):
+        try:
+            s_iso = (ev.get("start") or {}).get("dateTime")
+            e_iso = (ev.get("end") or {}).get("dateTime")
+            s_dt = datetime.fromisoformat(s_iso.replace("Z","+00:00")).astimezone(tz) if s_iso else None
+            e_dt = datetime.fromisoformat(e_iso.replace("Z","+00:00")).astimezone(tz) if e_iso else None
+        except Exception:
+            s_dt, e_dt = None, None
+
+        participants, _ = _load_participants(ev)
+        for p in participants:
+            p_name = (p.get("nombre") or "").strip()
+            p_wa   = (p.get("wa_id") or "").strip()
+
+            match = False
+            if wa_id:
+                match = (p_wa == wa_id)
+            elif name:
+                match = (_normalize_name(p_name) == _normalize_name(name))
+
+            if match:
+                rows.append({
+                    "event_id": ev.get("id"),
+                    "nombre": p_name or "(sin nombre)",
+                    "wa_id": p_wa,
+                    "inicio": s_dt.isoformat() if s_dt else "",
+                    "termino": e_dt.isoformat() if e_dt else "",
+                    "summary": ev.get("summary", ""),
+                    "htmlLink": ev.get("htmlLink"),
+                })
+
+    rows.sort(key=lambda r: r["inicio"])
+    return rows
+
+def _parse_date_qs(param_value: str | None, default_dt: datetime):
+    if not param_value:
+        return default_dt
+    try:
+        y, m, d = map(int, param_value.split("-"))
+        return default_dt.replace(year=y, month=m, day=d, hour=default_dt.hour, minute=default_dt.minute, second=default_dt.second)
+    except Exception:
+        return None
+
+@app.get("/clases/historial")
+def clases_historial_json():
+    tz = ZoneInfo(TIMEZONE)
+    now = datetime.now(tz)
+    # rango por defecto: últimos 90 días
+    d0 = request.args.get("start")
+    d1 = request.args.get("end")
+    wa  = request.args.get("wa_id")
+    nm  = request.args.get("name")
+
+    tmin = _parse_date_qs(d0, now - timedelta(days=90))
+    tmax = _parse_date_qs(d1, now)
+    if not tmin or not tmax:
+        return jsonify({"ok": False, "error": "start/end inválidos (YYYY-MM-DD)"}), 400
+
+    # normaliza a 00:00 y 23:59
+    tmin = tmin.replace(hour=0, minute=0, second=0)
+    tmax = tmax.replace(hour=23, minute=59, second=59)
+
+    rows = _class_history(tmin, tmax, wa_id=wa, name=nm)
+    return jsonify({
+        "ok": True,
+        "desde": tmin.isoformat(),
+        "hasta": tmax.isoformat(),
+        "filtro": {"wa_id": wa, "name": nm},
+        "total_clases": len(rows),
+        "detalle": rows
+    })
+
+@app.get("/clases/historial.html")
+def clases_historial_html():
+    tz = ZoneInfo(TIMEZONE)
+    now = datetime.now(tz)
+    d0 = request.args.get("start")
+    d1 = request.args.get("end")
+    wa  = request.args.get("wa_id")
+    nm  = request.args.get("name")
+
+    tmin = _parse_date_qs(d0, now - timedelta(days=90))
+    tmax = _parse_date_qs(d1, now)
+    if not tmin or not tmax:
+        return "start/end inválidos (YYYY-MM-DD)", 400
+
+    tmin = tmin.replace(hour=0, minute=0, second=0)
+    tmax = tmax.replace(hour=23, minute=59, second=59)
+
+    rows = _class_history(tmin, tmax, wa_id=wa, name=nm)
+
+    html = [
+        "<!doctype html><meta charset='utf-8'><title>Historial de clases</title>",
+        "<style>body{font-family:system-ui;margin:24px} table{border-collapse:collapse} th,td{padding:8px 10px;border:1px solid #ddd}</style>",
+        f"<h1>Historial de clases</h1>",
+        f"<p>Desde {tmin.strftime('%Y-%m-%d')} hasta {tmax.strftime('%Y-%m-%d')} — Filtro: "
+        f"{'wa_id='+wa if wa else ''}{' / ' if wa and nm else ''}{'name='+nm if nm else ''}</p>",
+        "<table><tr><th>Fecha</th><th>Inicio</th><th>Término</th><th>Nombre</th><th>Evento</th></tr>"
+    ]
+    for r in rows:
+        # fecha legible
+        try:
+            ini = datetime.fromisoformat(r["inicio"]).astimezone(tz)
+            fin = datetime.fromisoformat(r["termino"]).astimezone(tz)
+            fstr = ini.strftime("%Y-%m-%d")
+            istr = ini.strftime("%H:%M")
+            estr = fin.strftime("%H:%M")
+        except Exception:
+            fstr, istr, estr = "", "", ""
+
+        link = r["htmlLink"] or "#"
+        html.append(f"<tr><td>{fstr}</td><td>{istr}</td><td>{estr}</td><td>{r['nombre']}</td>"
+                    f"<td><a target='_blank' href='{link}'>ver</a></td></tr>")
     html.append("</table>")
     return Response("\n".join(html), headers={"Content-Type":"text/html; charset=utf-8"})
 
