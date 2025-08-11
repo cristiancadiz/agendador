@@ -1,6 +1,7 @@
 import os
 import re
 import json
+import time
 from uuid import uuid4
 from datetime import timedelta, datetime
 from zoneinfo import ZoneInfo
@@ -34,14 +35,31 @@ GREETING_TEXT = os.getenv(
     f"Hola 👋, somos {COMPANY_NAME}. Te ayudamos a agendar una llamada con un ejecutivo. ¿Cómo te llamas?"
 )
 
-# WhatsApp Cloud API (opcional)
+# WhatsApp Cloud API
 WA_TOKEN = os.getenv("WA_TOKEN")
-WA_PHONE_ID = os.getenv("WA_PHONE_ID")
+WA_PHONE_ID = os.getenv("WA_PHONE_ID")  # usado como fallback
 WA_VERIFY_TOKEN = os.getenv("WA_VERIFY_TOKEN", "verify_me")
-
-# Debug WA (logs de entrada/salida)
 DEBUG_WA = os.getenv("DEBUG_WA", "0") == "1"
 
+# Anti-duplicados (idempotencia webhook)
+WA_DEDUP_TTL = int(os.getenv("WA_DEDUP_TTL_SEC", "300"))  # 5 min
+_PROCESADOS = {}  # {message_id: expire_ts}
+
+def wa_is_dup(message_id: str) -> bool:
+    """True si ya procesamos este message_id dentro del TTL."""
+    now = time.time()
+    # limpia expirados
+    for k, exp in list(_PROCESADOS.items()):
+        if exp < now:
+            _PROCESADOS.pop(k, None)
+    if not message_id:
+        return False
+    if message_id in _PROCESADOS and _PROCESADOS[message_id] > now:
+        return True
+    _PROCESADOS[message_id] = now + WA_DEDUP_TTL
+    return False
+
+# Validaciones iniciales
 if not os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON"):
     raise Exception("Falta GOOGLE_SERVICE_ACCOUNT_JSON en variables de entorno.")
 if not CALENDAR_ID:
@@ -316,7 +334,7 @@ def create_event_calendar(nombre, datetime_text=None, fecha=None, hora=None,
     if not start_dt:
         return None, "Para agendar necesito la fecha y la hora exactas (ejemplo: 12/08 13:00)."
 
-    # Teléfono y email son obligatorios según la nueva política
+    # Teléfono y email son obligatorios
     telefono = (telefono or "").strip()
     email = (email or "").strip()
     if not telefono:
@@ -334,7 +352,6 @@ def create_event_calendar(nombre, datetime_text=None, fecha=None, hora=None,
     ).execute()
 
     msg = format_confirmation_message(nombre or "Cliente", start_dt, telefono)
-    # Adjuntamos extras para que el front los muestre
     created["telefono"] = telefono
     created["email"] = email
     return created, msg
@@ -567,7 +584,7 @@ def process_chat(session_id: str, user_msg: str, telefono: str = "", email: str 
             "datetime_text": cand.get("datetime_text") or slots.get("datetime_text"),
             "fecha": cand.get("fecha") or slots.get("fecha"),
             "hora":  cand.get("hora")  or slots.get("hora"),
-            # Fallback: si no tenemos teléfono/email en slots, usa los pasados por parámetro (web inputs o WA phone)
+            # Fallback desde web/WA
             "telefono": (slots.get("telefono") or telefono or "").strip(),
             "email": (slots.get("email") or email or "").strip(),
             "comentario": comentario
@@ -599,7 +616,6 @@ def process_chat(session_id: str, user_msg: str, telefono: str = "", email: str 
         session["awaiting_confirm"] = False
         session["candidate"] = None
         if not created:
-            # Si faltó teléfono o email, el mensaje de error ya lo indica
             history += [{"role":"user","content":user_msg},{"role":"assistant","content":msg}]
             return {"reply": msg, "done": False}
 
@@ -625,7 +641,7 @@ def chatbot():
     return jsonify(res)
 
 # =========================
-# WhatsApp Cloud API
+# WhatsApp Cloud API (con de-dup + phone_id dinámico)
 # =========================
 @app.get("/whatsapp/webhook")
 def wa_verify():
@@ -638,7 +654,7 @@ def wa_verify():
 
 @app.post("/whatsapp/webhook")
 def wa_incoming():
-    if not (WA_TOKEN and WA_PHONE_ID):
+    if not WA_TOKEN:
         return "whatsapp not configured", 200
 
     payload = request.get_json(silent=True) or {}
@@ -649,30 +665,41 @@ def wa_incoming():
         entry = (payload.get("entry") or [])[0]
         changes = (entry.get("changes") or [])[0]
         value = changes.get("value", {})
+
+        # usa el phone_number_id que recibió el evento
+        phone_id = (value.get("metadata") or {}).get("phone_number_id") or WA_PHONE_ID
+
         messages = value.get("messages", [])
         statuses = value.get("statuses", [])
 
+        # Ignora estatus (entregas/lecturas)
         if not messages:
             if DEBUG_WA and statuses:
                 print("WA STATUS >>>", json.dumps(statuses, ensure_ascii=False))
             return "ok", 200
 
-        msg = messages[0]
-        from_id = msg.get("from")  # E.164 SIN '+'
-        text = ""
-        if msg.get("type") == "text":
-            text = (msg.get("text", {}) or {}).get("body", "")
+        for msg in messages:
+            message_id = msg.get("id") or msg.get("wamid")
+            if wa_is_dup(message_id):
+                if DEBUG_WA:
+                    print("WA DUP >>>", message_id)
+                continue
 
-        # Fallback: en WhatsApp usamos el mismo número del remitente como teléfono si el usuario no lo entrega
-        res = process_chat(session_id=from_id, user_msg=text, telefono=from_id)
+            from_id = msg.get("from")
+            text = ""
+            if msg.get("type") == "text":
+                text = (msg.get("text", {}) or {}).get("body", "")
 
-        url = f"https://graph.facebook.com/v20.0/{WA_PHONE_ID}/messages"
-        headers = {"Authorization": f"Bearer {WA_TOKEN}", "Content-Type": "application/json"}
-        body = {"messaging_product": "whatsapp", "to": from_id, "text": {"body": res.get("reply") or "..."}} 
+            # Fallback: usa el número del remitente como teléfono si no lo entrega
+            res = process_chat(session_id=from_id, user_msg=text, telefono=from_id)
 
-        r = requests.post(url, headers=headers, json=body, timeout=30)
-        if DEBUG_WA:
-            print("WA OUT <<<", r.status_code, r.text)
+            url = f"https://graph.facebook.com/v20.0/{phone_id}/messages"
+            headers = {"Authorization": f"Bearer {WA_TOKEN}", "Content-Type": "application/json"}
+            body = {"messaging_product": "whatsapp", "to": from_id, "text": {"body": res.get("reply") or "..."}} 
+            r = requests.post(url, headers=headers, json=body, timeout=30)
+
+            if DEBUG_WA:
+                print("WA OUT <<<", r.status_code, r.text)
 
         return "ok", 200
     except Exception as e:
