@@ -34,6 +34,10 @@ GREETING_TEXT = os.getenv(
     "GREETING_TEXT",
     f"Hola 👋, somos {COMPANY_NAME}. Te inscribimos en clases. ¿Cuál es tu nombre?"
 )
+FALLBACK_REPLY = os.getenv(
+    "FALLBACK_REPLY",
+    "Disculpa, no alcancé a entender 😅. ¿Me indicas tu nombre y la fecha/hora de la clase? (ej: 12/08 18:00)"
+)
 
 # Horario de clases: Lunes–Viernes 09:00–18:00, duración 60 min
 BUSINESS_START_HOUR = 9
@@ -202,7 +206,10 @@ async function callBot(text){
     return;
   }
   const data = await resp.json();
-  addMsg(data.reply || '(sin respuesta)', 'bot');
+  const reply = (data.reply && data.reply.trim())
+    ? data.reply
+    : 'Disculpa, no entendí 😅. ¿Tu nombre y fecha/hora? (ej: 12/08 18:00)';
+  addMsg(reply, 'bot');
   if (data.done && data.evento) {
     addEventCard(data.evento.htmlLink, data.evento.icsUrl, data.evento.gcalAddUrl);
   }
@@ -459,7 +466,7 @@ def enroll_in_class(nombre, start_dt, end_dt, capacidad=None, titulo=None, wa_id
 
 
 # =========================
-# Chatbot con GPT 3.5 — SOLO nombre + fecha/hora
+# Chatbot con GPT 3.5 — SOLO nombre + fecha/hora (con fallback robusto)
 # =========================
 SYSTEM_PROMPT = (
     "Eres el asistente de inscripciones de un box de CrossFit. "
@@ -485,26 +492,34 @@ def llm_orchestrate(history, slots, awaiting_confirm, candidate, user_message):
     ]
     messages += history
     messages.append({"role": "user", "content": user_message})
-    messages.append({"role": "system", "content":
-        "Devuelve SOLO el JSON indicado, sin texto adicional."
-    })
-    resp = oa_client.chat.completions.create(model=OPENAI_MODEL, temperature=0.3, messages=messages)
-    raw = resp.choices[0].message.content or "{}"
+    messages.append({"role": "system", "content": "Devuelve SOLO el JSON indicado, sin texto adicional."})
+
+    # ✅ Manejo robusto de errores del LLM
     try:
-        data = json.loads(raw)
+        resp = oa_client.chat.completions.create(model=OPENAI_MODEL, temperature=0.3, messages=messages)
+        raw = (resp.choices[0].message.content or "").trim()
     except Exception:
-        data = {
-            "reply": "¿Me indicas tu nombre y la fecha/hora? (ej: 12/08 18:00).",
-            "slots": {"nombre":"", "datetime_text":"", "fecha":"", "hora":""},
-            "next_action": "ask_missing"
-        }
+        raw = ""
+
+    try:
+        data = json.loads(raw) if raw else {}
+    except Exception:
+        data = {}
+
+    if not isinstance(data, dict):
+        data = {}
+
     data.setdefault("reply", "")
     data.setdefault("slots", {"nombre":"", "datetime_text":"", "fecha":"", "hora":""})
-    data.setdefault("next_action", "none")
+    data.setdefault("next_action", "ask_missing")
     if "candidate" in data and isinstance(data["candidate"], dict):
         for k, v in list(data["candidate"].items()):
             if isinstance(v, str):
                 data["candidate"][k] = v.strip()
+
+    # ✅ Nunca devolver reply vacío
+    if not data["reply"]:
+        data["reply"] = FALLBACK_REPLY
     return data
 
 def process_chat(session_id: str, user_msg: str, wa_id: str | None = None):
@@ -762,7 +777,17 @@ def wa_incoming():
 
             url = f"https://graph.facebook.com/v20.0/{phone_id}/messages"
             headers = {"Authorization": f"Bearer {WA_TOKEN}", "Content-Type": "application/json"}
-            body = {"messaging_product": "whatsapp", "to": from_id, "text": {"body": res.get("reply") or "..."}} 
+
+            # ✅ Nunca enviar "..." si algo falló
+            safe_reply = (res.get("reply") or "").strip() if isinstance(res, dict) else ""
+            if not safe_reply:
+                safe_reply = FALLBACK_REPLY
+
+            body = {
+              "messaging_product": "whatsapp",
+              "to": from_id,
+              "text": {"body": safe_reply}
+            }
             r = requests.post(url, headers=headers, json=body, timeout=30)
             if DEBUG_WA:
                 print("WA OUT <<<", r.status_code, r.text)
