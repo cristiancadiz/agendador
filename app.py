@@ -18,8 +18,9 @@ from googleapiclient.errors import HttpError
 # OpenAI (GPT-3.5)
 from openai import OpenAI
 
-# WhatsApp Cloud API
+# WhatsApp Cloud API (opcional)
 import requests
+
 
 # =========================
 # Config / Entorno
@@ -38,7 +39,6 @@ GREETING_TEXT = os.getenv(
 # Horario de clases: Lunes–Viernes 09:00–18:00, duración 60 min
 BUSINESS_START_HOUR = 9
 BUSINESS_END_HOUR   = 18
-BUSINESS_BLOCK_WEEKENDS = True
 CLASS_DURATION_MIN = int(os.getenv("CLASS_DURATION_MIN", "60"))
 CLASS_CAPACITY_DEFAULT = int(os.getenv("CLASS_CAPACITY_DEFAULT", "12"))
 CLASS_TITLE_BASE = os.getenv("CLASS_TITLE_BASE", "Clase CrossFit")
@@ -55,6 +55,7 @@ _PROCESADOS = {}  # {message_id: expire_ts}
 
 def wa_is_dup(message_id: str) -> bool:
     now = time.time()
+    # limpia expirados
     for k, exp in list(_PROCESADOS.items()):
         if exp < now:
             _PROCESADOS.pop(k, None)
@@ -65,7 +66,8 @@ def wa_is_dup(message_id: str) -> bool:
     _PROCESADOS[message_id] = now + WA_DEDUP_TTL
     return False
 
-# Validaciones inicialess
+
+# Validaciones iniciales
 if not os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON"):
     raise Exception("Falta GOOGLE_SERVICE_ACCOUNT_JSON en variables de entorno.")
 if not CALENDAR_ID:
@@ -85,6 +87,7 @@ oa_client = OpenAI(api_key=OPENAI_API_KEY)
 # Flask app
 app = Flask(__name__)
 
+
 # =========================
 # Estado por sesión
 # =========================
@@ -102,6 +105,7 @@ def _get_session(session_id: str):
         }
         SESSIONS[session_id] = s
     return s
+
 
 # =========================
 # HTML: Chat Web (solo nombre + fecha + hora)
@@ -225,6 +229,7 @@ addMsg({{ greeting|tojson }});
 </html>
 """
 
+
 # =========================
 # Fechas: parser robusto (13 horas -> 13:00, etc.)
 # =========================
@@ -274,6 +279,7 @@ def parse_datetime_es(payload: dict):
             return dt
     return None
 
+
 # =========================
 # Business rules: L-V 09–18
 # =========================
@@ -293,6 +299,7 @@ def within_class_hours(start_dt, end_dt):
     if sm < BUSINESS_START_HOUR*60 or em > BUSINESS_END_HOUR*60:
         return False, f"El horario de clases es de {BUSINESS_START_HOUR:02d}:00 a {BUSINESS_END_HOUR:02d}:00."
     return True, ""
+
 
 # =========================
 # Links “Añadir a GCal” y .ics
@@ -335,8 +342,9 @@ def build_ics_from_event(ev: dict):
     ])
     return ics
 
+
 # =========================
-# Helpers de “clase con múltiples participantes”
+# Helpers de “clase con múltiples participantes” (con wa_id)
 # =========================
 def _load_participants(ev):
     extp = (ev.get("extendedProperties") or {}).get("private") or {}
@@ -361,7 +369,8 @@ def _save_participants(ev, participants, capacity, title=None):
     # Description legible
     lines = [ev.get("description") or "Tipo: Clase de CrossFit", "Participantes:"]
     for p in participants:
-        lines.append(f"- {p.get('nombre','')}")
+        pname = p.get('nombre','')
+        lines.append(f"- {pname}" if pname else "- (sin nombre)")
     ev["description"] = "\n".join(lines)
 
 def _find_class_event(start_dt, end_dt, title_prefix=None):
@@ -389,7 +398,7 @@ def _create_class_event(start_dt, end_dt, title_base, capacity):
     }
     return gc_service.events().insert(calendarId=CALENDAR_ID, body=body, sendUpdates="none").execute()
 
-def enroll_in_class(nombre, start_dt, end_dt, capacidad=None, titulo=None):
+def enroll_in_class(nombre, start_dt, end_dt, capacidad=None, titulo=None, wa_id=None):
     cap = int(capacidad or CLASS_CAPACITY_DEFAULT)
     title_base = titulo or f"{CLASS_TITLE_BASE} {start_dt.astimezone(ZoneInfo(TIMEZONE)).strftime('%H:%M')}"
 
@@ -400,12 +409,24 @@ def enroll_in_class(nombre, start_dt, end_dt, capacidad=None, titulo=None):
     participants, extp = _load_participants(ev)
     curr_cap = int(extp.get("capacity", cap))
 
-    # Evitar duplicados por nombre exacto
+    def _norm(n): 
+        return re.sub(r"\s+", " ", (n or "").strip().lower())
+
+    # Dedupe por wa_id primero; si no hay, por nombre
     for p in participants:
-        if p.get("nombre","").strip().lower() == (nombre or "").strip().lower():
+        if wa_id and p.get("wa_id") == wa_id:
             hora_txt = start_dt.astimezone(ZoneInfo(TIMEZONE)).strftime("%H:%M")
             msg = f"Ya estabas inscrito/a en {title_base} a las {hora_txt}. ¡Te esperamos!"
-            # Aun así devolvemos links
+            updated = ev
+            gcal_link = make_gcal_template_link(updated.get("summary","Clase"), start_dt, end_dt, updated.get("description",""))
+            base = request.host_url.rstrip("/")
+            ics_url = f"{base}/ics/{updated.get('id')}.ics"
+            updated["gcalAddUrl"] = gcal_link
+            updated["icsUrl"] = ics_url
+            return updated, msg
+        if not wa_id and _norm(p.get("nombre")) == _norm(nombre):
+            hora_txt = start_dt.astimezone(ZoneInfo(TIMEZONE)).strftime("%H:%M")
+            msg = f"Ya estabas inscrito/a en {title_base} a las {hora_txt}. ¡Te esperamos!"
             updated = ev
             gcal_link = make_gcal_template_link(updated.get("summary","Clase"), start_dt, end_dt, updated.get("description",""))
             base = request.host_url.rstrip("/")
@@ -417,8 +438,10 @@ def enroll_in_class(nombre, start_dt, end_dt, capacidad=None, titulo=None):
     if len(participants) >= curr_cap:
         return None, f"La clase ya está completa ({len(participants)}/{curr_cap}). ¿Quieres otra hora?"
 
+    # Agregar participante
     participants.append({
         "nombre": nombre,
+        "wa_id": wa_id or "",
         "ts": datetime.now(ZoneInfo(TIMEZONE)).isoformat()
     })
 
@@ -434,6 +457,7 @@ def enroll_in_class(nombre, start_dt, end_dt, capacidad=None, titulo=None):
     hora_txt = start_dt.astimezone(ZoneInfo(TIMEZONE)).strftime("%H:%M")
     msg = f"¡Listo {nombre}! Te inscribí en {title_base} a las {hora_txt}. Cupos: {len(participants)}/{curr_cap}."
     return updated, msg
+
 
 # =========================
 # Chatbot con GPT 3.5 — SOLO nombre + fecha/hora
@@ -484,7 +508,7 @@ def llm_orchestrate(history, slots, awaiting_confirm, candidate, user_message):
                 data["candidate"][k] = v.strip()
     return data
 
-def process_chat(session_id: str, user_msg: str):
+def process_chat(session_id: str, user_msg: str, wa_id: str | None = None):
     session = _get_session(session_id)
     history = session["history"]
     slots = session["slots"]
@@ -540,19 +564,19 @@ def process_chat(session_id: str, user_msg: str):
             history += [{"role":"user","content":user_msg},{"role":"assistant","content":msg_hours}]
             return {"reply": msg_hours, "done": False}
 
-        # Inscribir (múltiples por evento)
+        # Inscribir (múltiples por evento) — pasamos wa_id para dedupe
         ev, msg = enroll_in_class(
             nombre=cand_or_slots["nombre"],
             start_dt=start_dt,
             end_dt=end_dt,
             capacidad=None,
-            titulo=None
+            titulo=None,
+            wa_id=wa_id
         )
         if not ev:
             history += [{"role":"user","content":user_msg},{"role":"assistant","content":msg}]
             return {"reply": msg, "done": False}
 
-        # Guardar "último" para posibles operaciones futuras (si las agregas)
         session["last_event_id"] = ev.get("id")
 
         # Reset de slots
@@ -573,6 +597,7 @@ def process_chat(session_id: str, user_msg: str):
     history += [{"role":"user","content":user_msg},{"role":"assistant","content":reply}]
     return {"reply": reply, "done": False}
 
+
 # =========================
 # Vistas básicas
 # =========================
@@ -583,7 +608,15 @@ def root():
 @app.get("/chat")
 def chat_ui():
     subtitle = "Indícame tu <b>nombre</b> y la <b>fecha/hora</b> de la clase (ej: <code>12/08 a las 18 horas</code>)."
-    return render_template_string(CHAT_HTML, tz=TIMEZONE, greeting=GREETING_TEXT, subtitle=subtitle, header="Inscripción a clases", title="Clases", cal=CALENDAR_ID)
+    return render_template_string(
+        CHAT_HTML,
+        tz=TIMEZONE,
+        greeting=GREETING_TEXT,
+        subtitle=subtitle,
+        header="Inscripción a clases",
+        title="Clases",
+        cal=CALENDAR_ID
+    )
 
 @app.post("/chatbot")
 def chatbot():
@@ -591,6 +624,7 @@ def chatbot():
     res = process_chat(
         session_id=(data.get("session_id") or "default"),
         user_msg=(data.get("message") or "").strip(),
+        wa_id=None  # en chat web no tenemos wa_id
     )
     return jsonify(res)
 
@@ -677,6 +711,7 @@ def ics_download(event_id):
     }
     return Response(ics, headers=headers)
 
+
 # =========================
 # WhatsApp Cloud API (opcional)
 # =========================
@@ -718,12 +753,13 @@ def wa_incoming():
                     print("WA DUP >>>", message_id)
                 continue
 
-            from_id = msg.get("from")
+            from_id = msg.get("from")  # este es el wa_id del usuario
             text = ""
             if msg.get("type") == "text":
                 text = (msg.get("text", {}) or {}).get("body", "")
 
-            res = process_chat(session_id=from_id, user_msg=text)
+            # Pasamos wa_id para dedupe y estadística
+            res = process_chat(session_id=from_id, user_msg=text, wa_id=from_id)
 
             url = f"https://graph.facebook.com/v20.0/{phone_id}/messages"
             headers = {"Authorization": f"Bearer {WA_TOKEN}", "Content-Type": "application/json"}
@@ -759,6 +795,188 @@ def wa_incoming():
         if DEBUG_WA:
             print("WA ERROR !!!", repr(e))
         return "ok", 200
+
+
+# =========================
+# STATS: clases por persona (nombre o wa_id)
+# =========================
+from collections import defaultdict
+
+def _normalize_name(n: str) -> str:
+    return re.sub(r"\s+", " ", (n or "").strip().lower())
+
+def _parse_date(s: str):
+    try:
+        y, m, d = map(int, s.split("-"))
+        return date(y, m, d)
+    except Exception:
+        return None
+
+def _iter_class_events(tmin_dt: datetime, tmax_dt: datetime):
+    page = None
+    while True:
+        resp = gc_service.events().list(
+            calendarId=CALENDAR_ID,
+            timeMin=tmin_dt.isoformat(),
+            timeMax=tmax_dt.isoformat(),
+            singleEvents=True,
+            orderBy="startTime",
+            maxResults=2500,
+            pageToken=page
+        ).execute()
+        for ev in (resp.get("items") or []):
+            extp = (ev.get("extendedProperties") or {}).get("private") or {}
+            if extp.get("type") == "class":
+                yield ev
+        page = resp.get("nextPageToken")
+        if not page:
+            break
+
+def _class_stats(tmin_dt: datetime, tmax_dt: datetime, group_by="name"):
+    tz = ZoneInfo(TIMEZONE)
+    counts = {}
+    first_seen = {}
+    last_seen = {}
+    display_name = {}
+
+    def push(key, shown_name, when_dt):
+        counts[key] = counts.get(key, 0) + 1
+        display_name.setdefault(key, shown_name)
+        if when_dt:
+            if key not in first_seen or when_dt < first_seen[key]:
+                first_seen[key] = when_dt
+            if key not in last_seen or when_dt > last_seen[key]:
+                last_seen[key] = when_dt
+
+    for ev in _iter_class_events(tmin_dt, tmax_dt):
+        try:
+            start_iso = (ev.get("start") or {}).get("dateTime")
+            start_dt = datetime.fromisoformat(start_iso.replace("Z","+00:00")).astimezone(tz) if start_iso else None
+        except Exception:
+            start_dt = None
+
+        participants, _ = _load_participants(ev)
+        # dedupe por (evento, key)
+        seen_keys_in_event = set()
+        for p in participants:
+            name = (p.get("nombre") or "").strip()
+            wa = (p.get("wa_id") or "").strip()
+            if group_by == "wa" and wa:
+                key = f"wa:{wa}"
+                shown = name or wa
+            else:
+                key = f"nm:{_normalize_name(name)}"
+                shown = name or "(sin nombre)"
+            ek = (ev.get("id"), key)
+            if ek in seen_keys_in_event:
+                continue
+            seen_keys_in_event.add(ek)
+            push(key, shown, start_dt)
+
+    rows = []
+    for key, c in sorted(counts.items(), key=lambda kv: (-kv[1], display_name[kv[0]].lower())):
+        rows.append({
+            "key": key,
+            "nombre": display_name[key],
+            "clases": c,
+            "primera": first_seen.get(key).strftime("%Y-%m-%d %H:%M") if first_seen.get(key) else "",
+            "ultima":  last_seen.get(key).strftime("%Y-%m-%d %H:%M") if last_seen.get(key) else "",
+        })
+    return rows
+
+@app.get("/clases/stats")
+def clases_stats_json():
+    tz = ZoneInfo(TIMEZONE)
+    now = datetime.now(tz)
+    start_s = request.args.get("start")  # YYYY-MM-DD
+    end_s   = request.args.get("end")    # YYYY-MM-DD
+    group_by = (request.args.get("group_by") or "name").lower()
+
+    if start_s:
+        d0 = _parse_date(start_s)
+        if not d0: return jsonify({"ok": False, "error": "start inválido (YYYY-MM-DD)"}), 400
+        tmin = datetime(d0.year, d0.month, d0.day, 0, 0, tzinfo=tz)
+    else:
+        tmin = now - timedelta(days=90)
+
+    if end_s:
+        d1 = _parse_date(end_s)
+        if not d1: return jsonify({"ok": False, "error": "end inválido (YYYY-MM-DD)"}), 400
+        tmax = datetime(d1.year, d1.month, d1.day, 23, 59, 59, tzinfo=tz)
+    else:
+        tmax = now
+
+    rows = _class_stats(tmin, tmax, group_by=group_by)
+    return jsonify({"ok": True, "desde": tmin.isoformat(), "hasta": tmax.isoformat(), "group_by": group_by, "total_personas": len(rows), "detalle": rows})
+
+@app.get("/clases/stats.csv")
+def clases_stats_csv():
+    from io import StringIO
+    import csv
+    tz = ZoneInfo(TIMEZONE)
+    now = datetime.now(tz)
+    start_s = request.args.get("start")
+    end_s   = request.args.get("end")
+    group_by = (request.args.get("group_by") or "name").lower()
+
+    if start_s:
+        d0 = _parse_date(start_s)
+        if not d0: return "start inválido", 400
+        tmin = datetime(d0.year, d0.month, d0.day, 0, 0, tzinfo=tz)
+    else:
+        tmin = now - timedelta(days=90)
+
+    if end_s:
+        d1 = _parse_date(end_s)
+        if not d1: return "end inválido", 400
+        tmax = datetime(d1.year, d1.month, d1.day, 23, 59, 59, tzinfo=tz)
+    else:
+        tmax = now
+
+    rows = _class_stats(tmin, tmax, group_by=group_by)
+    buf = StringIO()
+    w = csv.writer(buf)
+    w.writerow(["clave","nombre","clases","primera","ultima"])
+    for r in rows:
+        w.writerow([r["key"], r["nombre"], r["clases"], r["primera"], r["ultima"]])
+    out = buf.getvalue()
+    return Response(out, headers={
+        "Content-Type": "text/csv; charset=utf-8",
+        "Content-Disposition": "attachment; filename=clases_stats.csv"
+    })
+
+@app.get("/clases/stats.html")
+def clases_stats_html():
+    tz = ZoneInfo(TIMEZONE)
+    now = datetime.now(tz)
+    start_s = request.args.get("start")
+    end_s   = request.args.get("end")
+    group_by = (request.args.get("group_by") or "name").lower()
+
+    if start_s:
+        d0 = _parse_date(start_s)
+        if not d0: return "start inválido", 400
+        tmin = datetime(d0.year, d0.month, d0.day, 0, 0, tzinfo=tz)
+    else:
+        tmin = now - timedelta(days=90)
+
+    if end_s:
+        d1 = _parse_date(end_s)
+        if not d1: return "end inválido", 400
+        tmax = datetime(d1.year, d1.month, d1.day, 23, 59, 59, tzinfo=tz)
+    else:
+        tmax = now
+
+    rows = _class_stats(tmin, tmax, group_by=group_by)
+    html = ["<!doctype html><meta charset='utf-8'><title>Stats clases</title>"]
+    html.append("<style>body{font-family:system-ui;margin:24px} table{border-collapse:collapse} th,td{padding:8px 10px;border:1px solid #ddd}</style>")
+    html.append(f"<h1>Estadísticas de clases</h1><p>Desde {tmin.strftime('%Y-%m-%d')} hasta {tmax.strftime('%Y-%m-%d')} (agrupado por: <b>{group_by}</b>)</p>")
+    html.append("<table><tr><th>Clave</th><th>Nombre</th><th>Clases</th><th>Primera</th><th>Última</th></tr>")
+    for r in rows:
+        html.append(f"<tr><td>{r['key']}</td><td>{r['nombre']}</td><td>{r['clases']}</td><td>{r['primera']}</td><td>{r['ultima']}</td></tr>")
+    html.append("</table>")
+    return Response("\n".join(html), headers={"Content-Type":"text/html; charset=utf-8"})
+
 
 # =========================
 # Main dev
