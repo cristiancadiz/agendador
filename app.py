@@ -16,6 +16,9 @@ from googleapiclient.errors import HttpError
 # OpenAI (GPT 3.5 Turbo)
 from openai import OpenAI
 
+# HTTP para WhatsApp Cloud API
+import requests
+
 # =========================
 # Configuración / Entorno
 # =========================
@@ -23,6 +26,11 @@ TIMEZONE = os.getenv("TIMEZONE", "America/Santiago")
 CALENDAR_ID = os.getenv("GOOGLE_CALENDAR_ID")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 OPENAI_MODEL = "gpt-3.5-turbo"  # fijo
+
+# WhatsApp Cloud API (opcional, pero si lo usas deben existir)
+WA_TOKEN = os.getenv("WA_TOKEN")
+WA_PHONE_ID = os.getenv("WA_PHONE_ID")
+WA_VERIFY_TOKEN = os.getenv("WA_VERIFY_TOKEN", "verify_me")
 
 if not os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON"):
     raise Exception("Falta GOOGLE_SERVICE_ACCOUNT_JSON en variables de entorno.")
@@ -205,7 +213,7 @@ def parse_datetime_es(payload: dict):
     Convierte texto o (fecha+hora) a datetime con tz.
     - DATE_ORDER=DMY (12/08 = 12 de agosto)
     - Normaliza '14 horas/hrs' y 'a las 14' -> '14:00'
-    - Requiere hora cuando viene por texto natural (si no, devuelve None)
+    - Requiere hora cuando viene por texto natural
     - Prefer future; RELATIVE_BASE ahora en TZ
     """
     now = datetime.now(ZoneInfo(TIMEZONE))
@@ -217,12 +225,11 @@ def parse_datetime_es(payload: dict):
         "DATE_ORDER": "DMY",
     }
 
-    # --- Texto natural ---
+    # Texto natural
     dt_text = (payload.get("datetime_text") or "").strip()
     if dt_text:
         if not _has_time_token(dt_text):
-            # si no menciona hora, no aceptamos
-            return None
+            return None  # falta hora
         txt = dt_text.lower()
         txt = re.sub(r"\b(a\s*las\s*)?(\d{1,2})\s*(h|hs|hrs|horas)\b", r"\2:00", txt)
         txt = re.sub(r"\b(a\s*las\s*)?(\d{1,2})\b(?=\s*$)", r"\2:00", txt)
@@ -230,7 +237,7 @@ def parse_datetime_es(payload: dict):
         if dt:
             return dt
 
-    # --- Fecha + hora separadas ---
+    # Fecha + hora separadas
     fecha = (payload.get("fecha") or "").strip()
     hora = (payload.get("hora") or "").strip()
     if fecha and hora:
@@ -240,8 +247,7 @@ def parse_datetime_es(payload: dict):
         if dt:
             return dt
 
-    # --- Solo fecha (no aceptamos por chat; falta hora) ---
-    # Si quieres default 10:00 en formularios, maneja fuera.
+    # Solo fecha (permitible en formulario con default 10:00)
     if fecha and not hora and payload.get("_allow_date_only"):
         dt = dateparser.parse(f"{fecha} 10:00", languages=["es"], settings=settings)
         if dt:
@@ -420,8 +426,7 @@ def crear_cita_api():
 SYSTEM_PROMPT = (
     "Eres un asistente para agendar citas (Chile). "
     "Objetivo: obtener NOMBRE y FECHA/HORA. Duración fija: 30 minutos. "
-    "No inventes datos. Si el último mensaje del usuario NO trae un valor, deja ese campo vacío. "
-    "Los ejemplos son solo ejemplos, nunca valores reales."
+    "No inventes datos. Si el último mensaje del usuario NO trae un valor, déjalo vacío."
 )
 
 def _get_session(session_id: str):
@@ -439,12 +444,7 @@ def gpt_extract_fields(history, user_message):
     instruction = (
         "Devuelve SOLO este JSON, con valores extraídos EXCLUSIVAMENTE del último mensaje del usuario. "
         "Si un valor no aparece en el último mensaje, déjalo vacío ('').\n"
-        "{\n"
-        "  \"nombre\": \"\",\n"
-        "  \"datetime_text\": \"\",\n"
-        "  \"fecha\": \"\",\n"
-        "  \"hora\": \"\"\n"
-        "}\n"
+        "{ \"nombre\":\"\", \"datetime_text\":\"\", \"fecha\":\"\", \"hora\":\"\" }\n"
         "Nada de texto fuera del JSON."
     )
     messages.append({"role": "system", "content": instruction})
@@ -462,60 +462,108 @@ def gpt_extract_fields(history, user_message):
             data[k] = data[k].strip()
     return data
 
-@app.post("/chatbot")
-def chatbot():
-    data = request.get_json(silent=True) or {}
-    session_id = data.get("session_id") or "default"
-    user_msg = (data.get("message") or "").strip()
-    telefono = (data.get("telefono") or "").strip()
-    comentario = (data.get("comentario") or "").strip()
-
-    if not user_msg:
-        return jsonify({"reply": "Cuéntame tu nombre y para qué fecha y hora quieres agendar.", "done": False})
-
+def process_chat(session_id: str, user_msg: str, telefono: str = "", comentario: str = ""):
+    """Reutiliza la misma lógica para /chatbot y WhatsApp."""
     session = _get_session(session_id)
     history = session["history"]
     slots = session["slots"]
 
-    # 1) Extraer SOLO del último mensaje
+    if not user_msg:
+        return {"reply": "Cuéntame tu nombre y para qué fecha y hora quieres agendar.", "done": False}
+
     extracted = gpt_extract_fields(history, user_msg)
-    # 2) Merge en slots (solo si vino algo nuevo)
     for k in ["nombre", "datetime_text", "fecha", "hora"]:
         if extracted.get(k):
             slots[k] = extracted[k]
 
-    # 3) Verificar completitud (no confiamos en el modelo)
     have_nombre = bool(slots["nombre"])
     have_time_from_text = bool(slots["datetime_text"]) and _has_time_token(slots["datetime_text"])
     have_fecha_hora = bool(slots["fecha"]) and bool(slots["hora"])
-    ready = have_nombre and (have_time_from_text or have_fecha_hora)
 
     if not have_nombre:
         reply = "¿Cuál es tu nombre?"
-    elif not (have_time_from_text or have_fecha_hora):
-        reply = "¿Para qué fecha y hora quieres la cita? (ej: 12/08 14:00)"
-    else:
-        # 4) Crear cita (30 min)
-        created, msg = create_event_calendar(
-            nombre=slots["nombre"],
-            datetime_text=slots["datetime_text"] if have_time_from_text else None,
-            fecha=slots["fecha"] if have_fecha_hora else None,
-            hora=slots["hora"] if have_fecha_hora else None,
-            telefono=telefono,
-            comentario=comentario,
-        )
-        if not created:
-            reply = "No pude entender la fecha/hora. ¿Confirmas fecha (DD/MM o YYYY-MM-DD) y hora (HH:MM 24h)?"
-            ready = False
-        else:
-            # limpiar slots para una nueva cita si el usuario sigue escribiendo
-            session["slots"] = {"nombre":"", "datetime_text":"", "fecha":"", "hora":""}
-            history += [{"role": "user", "content": user_msg}, {"role": "assistant", "content": msg}]
-            return jsonify({"reply": msg, "done": True, "evento": created})
+        history += [{"role": "user", "content": user_msg}, {"role": "assistant", "content": reply}]
+        return {"reply": reply, "done": False}
 
-    # guardar turno y responder
-    history += [{"role": "user", "content": user_msg}, {"role": "assistant", "content": reply}]
-    return jsonify({"reply": reply, "done": False})
+    if not (have_time_from_text or have_fecha_hora):
+        reply = "¿Para qué fecha y hora quieres la cita? (ej: 12/08 14:00)"
+        history += [{"role": "user", "content": user_msg}, {"role": "assistant", "content": reply}]
+        return {"reply": reply, "done": False}
+
+    created, msg = create_event_calendar(
+        nombre=slots["nombre"],
+        datetime_text=slots["datetime_text"] if have_time_from_text else None,
+        fecha=slots["fecha"] if have_fecha_hora else None,
+        hora=slots["hora"] if have_fecha_hora else None,
+        telefono=telefono,
+        comentario=comentario,
+    )
+
+    if not created:
+        reply = "No pude entender la fecha/hora. ¿Confirmas fecha (DD/MM o YYYY-MM-DD) y hora (HH:MM 24h)?"
+        history += [{"role": "user", "content": user_msg}, {"role": "assistant", "content": reply}]
+        return {"reply": reply, "done": False}
+
+    # limpiar slots para una nueva cita
+    session["slots"] = {"nombre":"", "datetime_text":"", "fecha":"", "hora":""}
+    history += [{"role": "user", "content": user_msg}, {"role": "assistant", "content": msg}]
+    return {"reply": msg, "done": True, "evento": created}
+
+@app.post("/chatbot")
+def chatbot():
+    data = request.get_json(silent=True) or {}
+    res = process_chat(
+        session_id=(data.get("session_id") or "default"),
+        user_msg=(data.get("message") or "").strip(),
+        telefono=(data.get("telefono") or "").strip(),
+        comentario=(data.get("comentario") or "").strip(),
+    )
+    return jsonify(res)
+
+# =========================
+# WhatsApp Cloud API
+# =========================
+@app.get("/whatsapp/webhook")
+def wa_verify():
+    mode = request.args.get("hub.mode")
+    token = request.args.get("hub.verify_token")
+    challenge = request.args.get("hub.challenge")
+    if mode == "subscribe" and token == WA_VERIFY_TOKEN:
+        return challenge, 200
+    return "forbidden", 403
+
+@app.post("/whatsapp/webhook")
+def wa_incoming():
+    if not (WA_TOKEN and WA_PHONE_ID):
+        return "whatsapp not configured", 200
+
+    payload = request.get_json(silent=True) or {}
+    try:
+        entry = (payload.get("entry") or [])[0]
+        changes = (entry.get("changes") or [])[0]
+        value = changes.get("value", {})
+        messages = value.get("messages", [])
+        if not messages:
+            return "ok", 200
+
+        msg = messages[0]
+        from_id = msg.get("from")  # teléfono del usuario (E.164)
+        text = ""
+        if msg.get("type") == "text":
+            text = (msg.get("text", {}) or {}).get("body", "")
+
+        # Procesar
+        res = process_chat(session_id=from_id, user_msg=text)
+
+        # Responder por WhatsApp
+        url = f"https://graph.facebook.com/v20.0/{WA_PHONE_ID}/messages"
+        headers = {"Authorization": f"Bearer {WA_TOKEN}", "Content-Type": "application/json"}
+        body = {"messaging_product": "whatsapp", "to": from_id, "text": {"body": res.get("reply") or "..."}} 
+        requests.post(url, headers=headers, json=body, timeout=30)
+
+        return "ok", 200
+    except Exception:
+        return "ok", 200
 
 # =========================
 # Main dev
