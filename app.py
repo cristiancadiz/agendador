@@ -29,7 +29,7 @@ CALENDAR_ID = os.getenv("GOOGLE_CALENDAR_ID")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 OPENAI_MODEL = "gpt-3.5-turbo"
 
-COMPANY_NAME = os.getenv("COMPANY_NAME", "Departamento de Cobranza")
+COMPANY_NAME = os.getenv("COMPANY_NAME", "la Ortiga")
 GREETING_TEXT = os.getenv(
     "GREETING_TEXT",
     f"Hola 👋, somos {COMPANY_NAME}. Te ayudamos a agendar una llamada con un ejecutivo. ¿Cómo te llamas?"
